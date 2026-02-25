@@ -89,4 +89,3 @@ Press `:` to enter command mode. The scanner will pause while you type.
 | `:help` | `:help` | Show the available command list. |
 
 The engine includes an intelligent auto-filtering mechanism. If a specific status code and response size combination is detected repetitively (threshold: 15 occurrences), it is automatically added to the size filter to reduce noise. These events are logged as `[AUTO-FILTER]` alerts.
-# DirFuzz
