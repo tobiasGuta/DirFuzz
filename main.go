@@ -33,6 +33,8 @@ func main() {
 	proxyListFlag := flag.String("proxies", "", "Path to SOCKS5 proxy list")
 	extFlag := flag.String("ext", "", "Extensions to append (comma-separated, e.g., php,txt)")
 	mutateFlag := flag.Bool("mutate", false, "Enable smart mutation for file backups")
+	methodFlag := flag.String("X", "", "HTTP Method(s) to use (comma-separated, e.g., GET,POST)")
+	smartAPIFlag := flag.Bool("smart-api", false, "Intelligently apply methods only to likely API paths")
 
 	// Custom Usage message to include TUI commands
 	flag.Usage = func() {
@@ -130,6 +132,18 @@ func main() {
 	eng.Config.Mutate = *mutateFlag
 	if *mutateFlag {
 		fmt.Println("[*] Smart Mutation enabled")
+	}
+
+	// Smart API Method Fuzzer
+	if *methodFlag != "" {
+		eng.Config.Methods = strings.Split(*methodFlag, ",")
+		for i := range eng.Config.Methods {
+			eng.Config.Methods[i] = strings.TrimSpace(strings.ToUpper(eng.Config.Methods[i]))
+		}
+	}
+	eng.Config.SmartAPI = *smartAPIFlag
+	if len(eng.Config.Methods) > 0 {
+		fmt.Printf("[*] Methods loaded: %v (Smart API: %v)\n", eng.Config.Methods, eng.Config.SmartAPI)
 	}
 
 	// Proxies

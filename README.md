@@ -11,6 +11,7 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
   - **Auto-Filter**: Automatically identifies and blocks repetitive responses (e.g., custom 404 pages returning 200 OK) during the scan.
 - **Recursive Scanning**: Automatically discovers directories and queues them for deeper scanning.
 - **Smart Mutation**: Generates common backup file checks (e.g., `.bak`, `.old`, `~`) when a file extension is detected.
+- **Smart API Method Fuzzer**: Test hidden REST API endpoints using a comma-separated list of HTTP methods, intelligently applied only to likely API paths to save bandwidth.
 - **Differential Analysis (Eagle Mode)**: Compare current scan results with a previous JSONL output to highlight changes.
 - **Proxy Support**: SOCKS5 proxy rotation.
 
@@ -34,6 +35,12 @@ go build -o dirfuzz main.go
 ./dirfuzz -url http://example.com -wordlist wordlist.txt -extensions php,txt -recursive -mutate
 ```
 
+### Smart API Method Fuzzing
+
+```bash
+./dirfuzz -url http://example.com -wordlist wordlist.txt -X GET,POST,PUT,DELETE -smart-api
+```
+
 ### Command Line Flags
 
 | Flag | Description | Default |
@@ -46,6 +53,8 @@ go build -o dirfuzz main.go
 | `-depth` | Max recursion depth | `3` |
 | `-ext` | Extensions to append (comma-separated) | |
 | `-mutate` | Enable smart mutation for file backups | `false` |
+| `-X` | HTTP Method(s) to use (comma-separated, e.g., `GET,POST`) | |
+| `-smart-api` | Intelligently apply methods only to likely API paths | `false` |
 | `-fs` | Filter Body Sizes (comma-separated) | |
 | `-mc` | Match Status Codes (comma-separated) | `200,204,301,302,307,401,403` |
 | `-delay` | Delay between requests (e.g., `10ms`, `1s`) | `0ms` |
@@ -88,4 +97,32 @@ Press `:` to enter command mode. The scanner will pause while you type.
 | `:run` | `:run` | Execute the command and force resume scanning. |
 | `:help` | `:help` | Show the available command list. |
 
+## Auto-Filtering
+
 The engine includes an intelligent auto-filtering mechanism. If a specific status code and response size combination is detected repetitively (threshold: 15 occurrences), it is automatically added to the size filter to reduce noise. These events are logged as `[AUTO-FILTER]` alerts.
+
+<img width="1915" height="1025" alt="image" src="https://github.com/user-attachments/assets/94b4f5d1-fdcb-4a7c-acc4-590dbe62a916" />
+
+<img width="1912" height="1023" alt="image" src="https://github.com/user-attachments/assets/52363bda-551f-40cf-ad5c-ebda4e2245a5" />
+
+## Commands 
+
+worker 10, set-delay 166ms, see more here [Go to Command Mode](#command-mode)
+
+<img width="1913" height="988" alt="image" src="https://github.com/user-attachments/assets/ffe6ce82-2f5f-48a3-9600-2066b6e0a5ae" />
+
+## Note
+
+DirFuzz is intentionally **not designed for collaborative development**.
+
+The architecture, optimizations, filtering logic, and performance tuning are based on my personal workflow, testing methodology, and performance benchmarks. Because of this, I will not be enabling open collaboration or accepting structural modification pull requests.
+
+However:
+
+-   You are absolutely free to fork the project.
+
+-   You may modify it as you wish.
+
+-   You can adapt it to your own workflows or research needs.
+
+If you build something interesting on top of it, feel free to reference the project.

@@ -967,8 +967,15 @@ func (m Model) View() string {
 				extras += lipgloss.NewStyle().Foreground(draculaCyan).Render(fmt.Sprintf(" [XPB:%s]", val))
 			}
 
-			line := fmt.Sprintf("%s %s %s %s%s %s%s",
+			methodStr := res.Method
+			if methodStr == "" {
+				methodStr = "HEAD"
+			}
+			methodFmt := lipgloss.NewStyle().Foreground(draculaPurple).Render(fmt.Sprintf("[%s]", methodStr))
+
+			line := fmt.Sprintf("%s %s %s %s %s%s %s%s",
 				prefix,
+				methodFmt,
 				pathStyle.Render(res.Path),
 				lipgloss.NewStyle().Foreground(draculaComment).Render("(Status:"),
 				statusStr,

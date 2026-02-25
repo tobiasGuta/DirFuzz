@@ -35,12 +35,16 @@ type Config struct {
 	WordlistPath string // Store original path for recursion
 	Extensions   []string
 	Mutate       bool
+	// Smart API Method Fuzzer
+	Methods  []string
+	SmartAPI bool
 }
 
 // Job represents a single scan task
 type Job struct {
-	Path  string
-	Depth int
+	Path   string
+	Depth  int
+	Method string
 }
 
 // Engine represents the core memory queue system for the brute-forcer.
@@ -92,6 +96,7 @@ type Engine struct {
 // Result holds the details of a successful fuzzing hit.
 type Result struct {
 	Path          string            `json:"path"`
+	Method        string            `json:"method,omitempty"`
 	StatusCode    int               `json:"status"`
 	Size          int               `json:"length"`
 	Headers       map[string]string `json:"headers,omitempty"`     // Captured interesting headers
@@ -109,7 +114,11 @@ func (r Result) String() string {
 	if val, ok := r.Headers["X-Powered-By"]; ok {
 		extras += fmt.Sprintf(" [X-Powered-By: %s]", val)
 	}
-	return fmt.Sprintf("[+] HIT: %s (Status: %d, Size: %d)%s", r.Path, r.StatusCode, r.Size, extras)
+	methodStr := r.Method
+	if methodStr == "" {
+		methodStr = "HEAD/GET"
+	}
+	return fmt.Sprintf("[+] [%s] HIT: %s (Status: %d, Size: %d)%s", methodStr, r.Path, r.StatusCode, r.Size, extras)
 }
 
 // NewEngine initializes a new Engine with a worker pool and a Bloom filter.
@@ -383,13 +392,33 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 	e.Config.RLock()
 	extMultiplier := int64(len(e.Config.Extensions) + 1) // +1 for the base word
+	methods := e.Config.Methods
+	smartAPI := e.Config.SmartAPI
 	e.Config.RUnlock()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		lineCount++
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		// Calculate method multiplier for this line
+		methodMultiplier := int64(1)
+		if len(methods) > 0 {
+			if !smartAPI {
+				methodMultiplier = int64(len(methods))
+			} else {
+				lowerLine := strings.ToLower(line)
+				if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
+					methodMultiplier = int64(len(methods))
+				}
+			}
+		}
+
+		lineCount += methodMultiplier * extMultiplier
 	}
-	atomic.StoreInt64(&e.TotalLines, lineCount*extMultiplier)
+	atomic.StoreInt64(&e.TotalLines, lineCount)
 
 	// Re-open file for actual processing (rewind doesn't work well on all OS/file types with scanner)
 	file.Close()
@@ -426,24 +455,42 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 			line := scanner.Text()
 			if line != "" {
-				// Extension Logic
-				// 1. Send Base
-				e.Submit(Job{Path: line, Depth: 0})
-
-				// 2. Send Extensions
 				e.Config.RLock()
+				methods := e.Config.Methods
+				smartAPI := e.Config.SmartAPI
 				// Create copy to iterate safely
 				exts := make([]string, len(e.Config.Extensions))
 				copy(exts, e.Config.Extensions)
 				e.Config.RUnlock()
 
-				for _, ext := range exts {
-					// Handle if user provided dot or not
-					cleanExt := strings.TrimSpace(ext)
-					if !strings.HasPrefix(cleanExt, ".") {
-						cleanExt = "." + cleanExt
+				// Determine methods to use for this line
+				var methodsToUse []string
+				if len(methods) == 0 {
+					methodsToUse = []string{""}
+				} else if !smartAPI {
+					methodsToUse = methods
+				} else {
+					lowerLine := strings.ToLower(line)
+					if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
+						methodsToUse = methods
+					} else {
+						methodsToUse = []string{""}
 					}
-					e.Submit(Job{Path: line + cleanExt, Depth: 0})
+				}
+
+				for _, method := range methodsToUse {
+					// 1. Send Base
+					e.Submit(Job{Path: line, Depth: 0, Method: method})
+
+					// 2. Send Extensions
+					for _, ext := range exts {
+						// Handle if user provided dot or not
+						cleanExt := strings.TrimSpace(ext)
+						if !strings.HasPrefix(cleanExt, ".") {
+							cleanExt = "." + cleanExt
+						}
+						e.Submit(Job{Path: line + cleanExt, Depth: 0, Method: method})
+					}
 				}
 			}
 		}
@@ -694,37 +741,101 @@ func (e *Engine) worker(id int) {
 			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 
-		// Using HEAD by default as requested to avoid full body downloads
-		// Re-enabling Keep-Alive to avoid socket churning
-		rawRequest := []byte(fmt.Sprintf(
-			"HEAD %s HTTP/1.1\r\n"+
-				"Host: %s\r\n"+
-				"Connection: keep-alive\r\n"+
-				"User-Agent: %s\r\n"+
-				"%s"+
-				"Accept: */*\r\n"+
-				"\r\n",
-			payload,
-			e.host,
-			ua,
-			headersStr.String(),
-		))
-
+		var rawRequest []byte
+		var resp *httpclient.RawResponse
 		target := e.baseURL
-
-		// Handle Proxy Logic if enabled
 		var proxyAddr string
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
 		}
 
-		resp, err := httpclient.SendRawRequest(target, rawRequest, 5*time.Second, proxyAddr)
-		atomic.AddInt64(&e.ProcessedLines, 1)
+		var successfulMethod string
 
-		if err != nil {
-			// e.g. timeouts, connection refused
-			atomic.AddInt64(&e.CountConnErr, 1)
-			continue
+		if job.Method == "" {
+			successfulMethod = "HEAD"
+			// Using HEAD by default as requested to avoid full body downloads
+			// Re-enabling Keep-Alive to avoid socket churning
+			rawRequest = []byte(fmt.Sprintf(
+				"HEAD %s HTTP/1.1\r\n"+
+					"Host: %s\r\n"+
+					"Connection: keep-alive\r\n"+
+					"User-Agent: %s\r\n"+
+					"%s"+
+					"Accept: */*\r\n"+
+					"\r\n",
+				payload,
+				e.host,
+				ua,
+				headersStr.String(),
+			))
+
+			resp, err = httpclient.SendRawRequest(target, rawRequest, 5*time.Second, proxyAddr)
+			atomic.AddInt64(&e.ProcessedLines, 1)
+
+			if err != nil {
+				// e.g. timeouts, connection refused
+				atomic.AddInt64(&e.CountConnErr, 1)
+				continue
+			}
+
+			// Fallback: If HEAD fails (405 Method Not Allowed / 501 Not Implemented), retry with GET
+			if resp.StatusCode == 405 || resp.StatusCode == 501 {
+				successfulMethod = "GET"
+				// Construct a minimal GET request
+				// We MUST force Connection: close and try to read only minimal data to be safe.
+				rawGET := []byte(fmt.Sprintf(
+					"GET %s HTTP/1.1\r\n"+
+						"Host: %s\r\n"+
+						"Connection: close\r\n"+
+						"User-Agent: %s\r\n"+
+						"%s"+ // Headers
+						"Accept: */*\r\n"+
+						"\r\n",
+					payload,
+					e.host,
+					ua,
+					headersStr.String(),
+				))
+
+				respFallback, errFallback := httpclient.SendRawRequest(target, rawGET, 5*time.Second, proxyAddr)
+				if errFallback == nil {
+					// Use the fallback response instead
+					resp = respFallback
+				} else {
+					// If GET fails, revert to HEAD method for logging
+					successfulMethod = "HEAD"
+				}
+			}
+		} else {
+			successfulMethod = job.Method
+			// Smart API Method Fuzzer logic
+			// Inject Content-Length: 0 for methods that might hang reverse proxies
+			if job.Method == "POST" || job.Method == "PUT" || job.Method == "PATCH" || job.Method == "DELETE" {
+				headersStr.WriteString("Content-Length: 0\r\n")
+			}
+
+			rawRequest = []byte(fmt.Sprintf(
+				"%s %s HTTP/1.1\r\n"+
+					"Host: %s\r\n"+
+					"Connection: close\r\n"+
+					"User-Agent: %s\r\n"+
+					"%s"+
+					"Accept: */*\r\n"+
+					"\r\n",
+				job.Method,
+				payload,
+				e.host,
+				ua,
+				headersStr.String(),
+			))
+
+			resp, err = httpclient.SendRawRequest(target, rawRequest, 5*time.Second, proxyAddr)
+			atomic.AddInt64(&e.ProcessedLines, 1)
+
+			if err != nil {
+				atomic.AddInt64(&e.CountConnErr, 1)
+				continue
+			}
 		}
 
 		// Update Stats Counters
@@ -738,38 +849,6 @@ func (e *Engine) worker(id int) {
 			atomic.AddInt64(&e.Count429, 1)
 		} else if resp.StatusCode >= 500 {
 			atomic.AddInt64(&e.Count500, 1)
-		}
-
-		// Fallback: If HEAD fails (405 Method Not Allowed / 501 Not Implemented), retry with GET
-		if resp.StatusCode == 405 || resp.StatusCode == 501 {
-			// Construct a minimal GET request
-			// We MUST force Connection: close and try to read only minimal data to be safe.
-			rawGET := []byte(fmt.Sprintf(
-				"GET %s HTTP/1.1\r\n"+
-					"Host: %s\r\n"+
-					"Connection: close\r\n"+
-					"User-Agent: %s\r\n"+
-					"%s"+ // Headers
-					"Accept: */*\r\n"+
-					"\r\n",
-				payload,
-				e.host,
-				ua,
-				headersStr.String(),
-			))
-
-			// Use the existing client. It already has built-in limits (8KB reads, SO_LINGER on close).
-			// This effectively implements the "Safe Teardown" requested because:
-			// 1. Connection: close tells server to disconnect.
-			// 2. Client reads 8KB max (header extraction logic).
-			// 3. Client forces Close() immediately after, triggering RST via SO_LINGER if customized.
-			respFallback, errFallback := httpclient.SendRawRequest(target, rawGET, 5*time.Second, proxyAddr)
-			if errFallback == nil {
-				// Use the fallback response instead
-				resp = respFallback
-				// Update stats for the retry? Probably not double count, but let's assume retry supersedes.
-				// The original 405/501 is effectively ignored.
-			}
 		}
 
 		// Filtering Logic
@@ -812,6 +891,7 @@ func (e *Engine) worker(id int) {
 				// Notify via special result
 				alert := Result{
 					Path:         "AUTO-FILTER",
+					Method:       successfulMethod,
 					StatusCode:   resp.StatusCode, // Reuse status for display
 					Size:         bodySize,
 					Headers:      map[string]string{"Msg": fmt.Sprintf("Auto-filtered repetitive size: %d", bodySize)},
@@ -852,6 +932,7 @@ func (e *Engine) worker(id int) {
 
 		result := Result{
 			Path:       payload,
+			Method:     successfulMethod,
 			StatusCode: resp.StatusCode,
 			Size:       bodySize,
 			Headers:    capturedHeaders,
@@ -881,13 +962,13 @@ func (e *Engine) worker(id int) {
 				// Requirement: "if the discovered path contains a file extension (using filepath.Ext(path) or checking for a .)"
 				if strings.Contains(payload, ".") {
 					// Launch in goroutine to avoid blocking the worker on channel send
-					go func(basePath string) {
+					go func(basePath string, method string) {
 						// Required mutations: path + ".bak", path + ".old", path + ".save", path + "~", and path + ".swp"
 						mutations := []string{".bak", ".old", ".save", "~", ".swp"}
 						for _, m := range mutations {
-							e.Submit(Job{Path: basePath + m, Depth: depth})
+							e.Submit(Job{Path: basePath + m, Depth: depth, Method: method})
 						}
-					}(payload)
+					}(payload, job.Method)
 				}
 			}
 		}
@@ -922,6 +1003,11 @@ func (e *Engine) worker(id int) {
 				}
 				defer f.Close()
 
+				e.Config.RLock()
+				methods := e.Config.Methods
+				smartAPI := e.Config.SmartAPI
+				e.Config.RUnlock()
+
 				// Scanner logic...
 				scanner := bufio.NewScanner(f)
 				for scanner.Scan() {
@@ -938,10 +1024,26 @@ func (e *Engine) worker(id int) {
 					}
 					newPath += strings.TrimPrefix(word, "/")
 
-					// Update TotalLines because recursive jobs extend the scan
-					atomic.AddInt64(&e.TotalLines, 1)
+					// Determine methods to use for this line
+					var methodsToUse []string
+					if len(methods) == 0 {
+						methodsToUse = []string{""}
+					} else if !smartAPI {
+						methodsToUse = methods
+					} else {
+						lowerLine := strings.ToLower(newPath)
+						if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
+							methodsToUse = methods
+						} else {
+							methodsToUse = []string{""}
+						}
+					}
 
-					e.Submit(Job{Path: newPath, Depth: nextDepth})
+					for _, method := range methodsToUse {
+						// Update TotalLines because recursive jobs extend the scan
+						atomic.AddInt64(&e.TotalLines, 1)
+						e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method})
+					}
 				}
 			}(payload, depth+1, wordlistPath)
 		}
@@ -957,7 +1059,11 @@ func (e *Engine) Submit(job Job) {
 	// The Bloom filter is not thread-safe for concurrent writes by default.
 	// We lock it to ensure safe concurrent submissions if there are multiple producers.
 	e.filterLock.Lock()
-	isDuplicate := e.filter.TestAndAddString(job.Path)
+	filterKey := job.Path
+	if job.Method != "" {
+		filterKey = job.Method + ":" + job.Path
+	}
+	isDuplicate := e.filter.TestAndAddString(filterKey)
 	e.filterLock.Unlock()
 
 	if isDuplicate {
