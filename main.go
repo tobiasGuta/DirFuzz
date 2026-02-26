@@ -35,6 +35,7 @@ func main() {
 	mutateFlag := flag.Bool("mutate", false, "Enable smart mutation for file backups")
 	methodFlag := flag.String("X", "", "HTTP Method(s) to use (comma-separated, e.g., GET,POST)")
 	smartAPIFlag := flag.Bool("smart-api", false, "Intelligently apply methods only to likely API paths")
+	workersFlag := flag.Int("W", 100, "Number of concurrent workers")
 
 	// Custom Usage message to include TUI commands
 	flag.Usage = func() {
@@ -69,12 +70,11 @@ func main() {
 		fmt.Println("Error: Invalid URL provided")
 		os.Exit(1)
 	}
-	// host := parsedURL.Host (host unused)
 
 	fmt.Println("Starting DirFuzz Engine...")
 
 	// Configuration
-	numWorkers := 100
+	numWorkers := *workersFlag
 	expectedItems := uint(10_000_000) // 10 million payloads
 	falsePositiveRate := 0.001        // 0.1% false positive rate
 
@@ -165,6 +165,7 @@ func main() {
 
 	// Start reading wordlist (if we have one on CLI)
 	if *wordlistPath != "" {
+		eng.AddScanner()
 		go eng.StartWordlistScanner(*wordlistPath)
 	}
 

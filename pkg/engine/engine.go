@@ -60,6 +60,7 @@ type Engine struct {
 	scannerCtx    context.Context
 	scannerCancel context.CancelFunc
 	scannerWg     sync.WaitGroup
+	activeJobs    sync.WaitGroup
 	Results       chan Result
 
 	// Eagle Mode State (Previous Scan Data)
@@ -366,12 +367,19 @@ func (e *Engine) ChangeWordlist(path string) error {
 	e.scannerCtx, e.scannerCancel = context.WithCancel(context.Background())
 
 	// Start new scanner
+	e.AddScanner()
 	go e.StartWordlistScanner(path)
 	return nil
 }
 
+// AddScanner increments the scanner waitgroup.
+func (e *Engine) AddScanner() {
+	e.scannerWg.Add(1)
+}
+
 // StartWordlistScanner reads from a Wordlist and submits payloads to the engine.
 func (e *Engine) StartWordlistScanner(path string) {
+	defer e.scannerWg.Done()
 	// Remember path for recursion
 	e.Config.Lock()
 	e.Config.WordlistPath = path
@@ -680,6 +688,22 @@ func (e *Engine) worker(id int) {
 	defer e.wg.Done()
 
 	for job := range e.jobs {
+		var doRecurse bool
+		var maxDepth int
+		var wordlistPath string
+		var result Result
+		var capturedHeaders map[string]string
+		var headerLines []string
+		var bodySize int
+		var clVal string
+		var successfulMethod string
+		var proxyAddr string
+		var target string
+		var resp *httpclient.RawResponse
+		var rawRequest []byte
+		var headersStr strings.Builder
+		var reqHost string
+		var reqPath string
 		payload := job.Path
 		depth := job.Depth
 
@@ -729,27 +753,43 @@ func (e *Engine) worker(id int) {
 			break
 		}
 
-		// Construct the raw request
-		// Ensure payload starts with /
-		if !strings.HasPrefix(payload, "/") {
-			payload = "/" + payload
+		// Construct the full URL
+		var fullURL string
+		word := payload
+		if strings.Contains(e.baseURL, "{PAYLOAD}") {
+			fullURL = strings.Replace(e.baseURL, "{PAYLOAD}", word, 1)
+		} else {
+			// Ensure word starts with /
+			if !strings.HasPrefix(word, "/") {
+				word = "/" + word
+			}
+			fullURL = strings.TrimRight(e.baseURL, "/") + word
 		}
 
+		parsedURL, errURL := url.Parse(fullURL)
+		if errURL != nil {
+			goto nextJob
+		}
+
+		reqPath = parsedURL.Path
+		if parsedURL.RawQuery != "" {
+			reqPath += "?" + parsedURL.RawQuery
+		}
+		if reqPath == "" {
+			reqPath = "/"
+		}
+		reqHost = parsedURL.Host
+
 		// Build headers string
-		var headersStr strings.Builder
+		headersStr.Reset()
 		for k, v := range headers {
 			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 
-		var rawRequest []byte
-		var resp *httpclient.RawResponse
-		target := e.baseURL
-		var proxyAddr string
+		target = e.baseURL
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
 		}
-
-		var successfulMethod string
 
 		if job.Method == "" {
 			successfulMethod = "HEAD"
@@ -763,8 +803,8 @@ func (e *Engine) worker(id int) {
 					"%s"+
 					"Accept: */*\r\n"+
 					"\r\n",
-				payload,
-				e.host,
+				reqPath,
+				reqHost,
 				ua,
 				headersStr.String(),
 			))
@@ -775,7 +815,7 @@ func (e *Engine) worker(id int) {
 			if err != nil {
 				// e.g. timeouts, connection refused
 				atomic.AddInt64(&e.CountConnErr, 1)
-				continue
+				goto nextJob
 			}
 
 			// Fallback: If HEAD fails (405 Method Not Allowed / 501 Not Implemented), retry with GET
@@ -791,8 +831,8 @@ func (e *Engine) worker(id int) {
 						"%s"+ // Headers
 						"Accept: */*\r\n"+
 						"\r\n",
-					payload,
-					e.host,
+					reqPath,
+					reqHost,
 					ua,
 					headersStr.String(),
 				))
@@ -823,8 +863,8 @@ func (e *Engine) worker(id int) {
 					"Accept: */*\r\n"+
 					"\r\n",
 				job.Method,
-				payload,
-				e.host,
+				reqPath,
+				reqHost,
 				ua,
 				headersStr.String(),
 			))
@@ -834,7 +874,7 @@ func (e *Engine) worker(id int) {
 
 			if err != nil {
 				atomic.AddInt64(&e.CountConnErr, 1)
-				continue
+				goto nextJob
 			}
 		}
 
@@ -854,14 +894,14 @@ func (e *Engine) worker(id int) {
 		// Filtering Logic
 		// 1. Check Status Code
 		if len(matchCodes) > 0 && !matchCodes[resp.StatusCode] {
-			continue
+			goto nextJob
 		}
 
 		// 2. Check Body Size
 		// Prefer Content-Length header if available, otherwise fallback to read body size.
 		// This handles the new optimization where we don't download the full body.
-		bodySize := len(resp.Body)
-		clVal := resp.GetHeader("Content-Length")
+		bodySize = len(resp.Body)
+		clVal = resp.GetHeader("Content-Length")
 		if clVal != "" {
 			if s, err := strconv.Atoi(clVal); err == nil {
 				bodySize = s
@@ -869,7 +909,7 @@ func (e *Engine) worker(id int) {
 		}
 
 		if len(filterSizes) > 0 && filterSizes[bodySize] {
-			continue
+			goto nextJob
 		}
 
 		// Smart Filter Logic: Check for repetitive results (likely false positives)
@@ -905,17 +945,17 @@ func (e *Engine) worker(id int) {
 
 			// If we already detected enough of these, drop this one.
 			if count >= 15 {
-				continue
+				goto nextJob
 			}
 		}
 
 		// Output result
 		// Capture interesting headers for fingerprinting
-		capturedHeaders := make(map[string]string)
+		capturedHeaders = make(map[string]string)
 
 		// Parse headers from the raw headers string
 		// Improve parsing to handle \n or \r\n
-		headerLines := strings.Split(strings.ReplaceAll(resp.Headers, "\r\n", "\n"), "\n")
+		headerLines = strings.Split(strings.ReplaceAll(resp.Headers, "\r\n", "\n"), "\n")
 		for _, line := range headerLines {
 			if idx := strings.Index(line, ":"); idx != -1 {
 				key := strings.TrimSpace(line[:idx])
@@ -930,7 +970,7 @@ func (e *Engine) worker(id int) {
 			}
 		}
 
-		result := Result{
+		result = Result{
 			Path:       payload,
 			Method:     successfulMethod,
 			StatusCode: resp.StatusCode,
@@ -975,9 +1015,9 @@ func (e *Engine) worker(id int) {
 
 		// Recursive Logic
 		e.Config.RLock()
-		doRecurse := e.Config.Recursive
-		maxDepth := e.Config.MaxDepth
-		wordlistPath := e.Config.WordlistPath
+		doRecurse = e.Config.Recursive
+		maxDepth = e.Config.MaxDepth
+		wordlistPath = e.Config.WordlistPath
 		e.Config.RUnlock()
 
 		if doRecurse && depth < maxDepth {
@@ -991,12 +1031,14 @@ func (e *Engine) worker(id int) {
 			// This ensures we rate-limit the checks and don't spawn thousands of goroutines that slam the server.
 			if e.checkRecursiveWildcard(payload) {
 				// It's a wildcard, skip recursion
-				continue
+				goto nextJob
 			}
 
 			// We spawn a goroutine to read the wordlist and queue jobs
 			// This part is CPU/Disk bound, not Network bound, so it's fine to be async to keep the worker free.
+			e.AddScanner()
 			go func(basePath string, nextDepth int, wlPath string) {
+				defer e.scannerWg.Done()
 				f, err := os.Open(wlPath)
 				if err != nil {
 					return
@@ -1048,6 +1090,9 @@ func (e *Engine) worker(id int) {
 			}(payload, depth+1, wordlistPath)
 		}
 
+	nextJob:
+		e.activeJobs.Done()
+
 		if shouldExit {
 			return
 		}
@@ -1073,12 +1118,15 @@ func (e *Engine) Submit(job Job) {
 		return
 	}
 
+	e.activeJobs.Add(1)
 	// Send to the worker queue
 	e.jobs <- job
 }
 
 // Wait closes the jobs channel and waits for all workers to finish processing.
 func (e *Engine) Wait() {
+	e.scannerWg.Wait()
+	e.activeJobs.Wait()
 	close(e.jobs)
 	e.wg.Wait()
 	close(e.Results)

@@ -2,6 +2,11 @@
 
 DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a Terminal User Interface (TUI) for real-time monitoring and interaction. It supports recursive scanning, smart filtering, mutation strategies, and differential analysis.
 
+<p align="center">
+  <img width="472" height="433" alt="image" src="https://github.com/user-attachments/assets/62b98b2e-1b36-4953-81a5-db05dabf2b71" />
+</p>
+
+
 ## Features
 
 - **High Concurrency**: Tunable worker pool for scanning.
@@ -12,6 +17,7 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 - **Recursive Scanning**: Automatically discovers directories and queues them for deeper scanning.
 - **Smart Mutation**: Generates common backup file checks (e.g., `.bak`, `.old`, `~`) when a file extension is detected.
 - **Smart API Method Fuzzer**: Test hidden REST API endpoints using a comma-separated list of HTTP methods, intelligently applied only to likely API paths to save bandwidth.
+- **Arbitrary Payload Injection**: Use the `{PAYLOAD}` keyword anywhere in the URL (e.g., `http://example.com/api/{PAYLOAD}/users`) to fuzz specific path segments or subdomains.
 - **Differential Analysis (Eagle Mode)**: Compare current scan results with a previous JSONL output to highlight changes.
 - **Proxy Support**: SOCKS5 proxy rotation.
 
@@ -19,6 +25,41 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 
 ```bash
 go build -o dirfuzz main.go
+```
+
+Install with Go
+---------------
+
+From inside your project directory (`DirFuzz/`), run:
+```bash
+go install
+```
+
+This builds the binary and places it in:
+```bash
+$HOME/go/bin
+```
+
+Now make sure that directory is in your PATH:
+```bash
+echo $PATH
+```
+
+If you don’t see $HOME/go/bin, add it:
+```bash
+echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.bashrc
+source ~/.bashrc
+```
+
+For zsh:
+```bash
+echo 'export PATH=$PATH:$HOME/go/bin' >> ~/.zshrc
+source ~/.zshrc
+```
+
+Now you can run:
+```bash
+dirfuzz -h
 ```
 
 ## Usage
@@ -41,12 +82,19 @@ go build -o dirfuzz main.go
 ./dirfuzz -url http://example.com -wordlist wordlist.txt -X GET,POST,PUT,DELETE -smart-api
 ```
 
+### Arbitrary Payload Injection
+
+```bash
+./dirfuzz -url http://localhost:3000/api/{PAYLOAD}/users -wordlist wordlist.txt -W 10
+```
+
 ### Command Line Flags
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-url` | Target URL to fuzz (Required) | |
 | `-wordlist` | Path to the wordlist file | |
+| `-W` | Number of concurrent workers | `100` |
 | `-tui` | Enable TUI mode | `true` |
 | `-cli` | Run in CLI mode (stdout only, disables TUI) | `false` |
 | `-recursive` | Enable recursive fuzzing | `false` |
@@ -110,6 +158,10 @@ The engine includes an intelligent auto-filtering mechanism. If a specific statu
 worker 10, set-delay 166ms, see more here [Go to Command Mode](#command-mode)
 
 <img width="1913" height="988" alt="image" src="https://github.com/user-attachments/assets/ffe6ce82-2f5f-48a3-9600-2066b6e0a5ae" />
+
+## Smart-api
+
+<img width="1919" height="1016" alt="Screenshot 2026-02-24 212226" src="https://github.com/user-attachments/assets/26765ee4-1a56-4132-936a-b43a3e031130" />
 
 ## Note
 
