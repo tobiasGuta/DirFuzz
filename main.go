@@ -44,6 +44,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\nTUI Commands (Internal):")
 		fmt.Fprintln(os.Stderr, "  :set-ua [AgentString]    Set User-Agent string")
 		fmt.Fprintln(os.Stderr, "  :add-header [Key]: [Val] Add custom HTTP header")
+		fmt.Fprintln(os.Stderr, "  :rm-header [Key]         Remove custom HTTP header")
 		fmt.Fprintln(os.Stderr, "  :set-delay [duration]    Set request delay")
 		fmt.Fprintln(os.Stderr, "  :filter-size [bytes]     Filter response size")
 		fmt.Fprintln(os.Stderr, "  :wordlist [path]         Hot-swap wordlist file")
@@ -94,6 +95,14 @@ func main() {
 	if err := eng.SetTarget(*targetURL); err != nil {
 		fmt.Printf("Error setting target: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Verify wordlist exists before starting anything
+	if *wordlistPath != "" {
+		if _, err := os.Stat(*wordlistPath); os.IsNotExist(err) {
+			fmt.Printf("Error: Wordlist file '%s' does not exist.\n", *wordlistPath)
+			os.Exit(1)
+		}
 	}
 
 	// Helper to parse comma-separated integers
@@ -165,8 +174,7 @@ func main() {
 
 	// Start reading wordlist (if we have one on CLI)
 	if *wordlistPath != "" {
-		eng.AddScanner()
-		go eng.StartWordlistScanner(*wordlistPath)
+		eng.KickoffScanner(*wordlistPath)
 	}
 
 	// Prepare output file (prioritizing -o if given, otherwise using project structure)
@@ -216,6 +224,7 @@ func main() {
 		}
 	}
 
+	eng.Config.OutputFile = filename
 	f, err := os.Create(filename)
 	if err != nil {
 		fmt.Printf("Error creating log file: %v\n", err)

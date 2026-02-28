@@ -131,7 +131,7 @@ Press `:` to enter command mode. The scanner will pause while you type.
 |---------|-------|-------------|
 | `:worker` | `:worker [int]` | Set the number of concurrent workers. |
 | `:set-ua` | `:set-ua [string]` | Set a custom User-Agent string. |
-| `:add-header` | `:add-header [Key]: [Value]` | Add a custom HTTP header. |
+| `:add-header` | `:add-header [Key]: [Value]` | Add a custom HTTP header. Ensures duplicate headers are safely rejected. |
 | `:rm-header` | `:rm-header [Key]` | Remove a custom HTTP header. |
 | `:set-delay` | `:set-delay [duration]` | Set request delay (e.g., `50ms`). |
 | `:filter-size` | `:filter-size [bytes]` | Add a response size to the filter list. |
@@ -142,8 +142,11 @@ Press `:` to enter command mode. The scanner will pause while you type.
 | `:rm-ext` | `:rm-ext [extension]` | Remove an extension. |
 | `:set-mutate` | `:set-mutate [on|off]` | Toggle smart mutation. |
 | `:wordlist` | `:wordlist [path]` | Hot-swap the current wordlist file. |
-| `:run` | `:run` | Execute the command and force resume scanning. |
+| `:run` | `:run` | Dynamically executes a complete scanner restart with all live configuration changes (wipes analytics cleanly, zeroes progress, and securely drains old queue requests). |
 | `:help` | `:help` | Show the available command list. |
+
+## Interactive Upgrades & Configuration View
+The DirFuzz Terminal UI now explicitly maps Mouse-Wheel natively for clean vertical viewport scrolling without layout desyncs. The configuration UI panel will now dynamically scale to fit all of your updated user agents, header strings, and loaded extensions simultaneously and without arbitrary `...` truncation overlapping into your execution table!
 
 ## Auto-Filtering
 

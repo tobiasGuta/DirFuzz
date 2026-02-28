@@ -36,8 +36,9 @@ type Config struct {
 	Extensions   []string
 	Mutate       bool
 	// Smart API Method Fuzzer
-	Methods  []string
-	SmartAPI bool
+	Methods    []string
+	SmartAPI   bool
+	OutputFile string
 }
 
 // Job represents a single scan task
@@ -45,10 +46,12 @@ type Job struct {
 	Path   string
 	Depth  int
 	Method string
+	RunID  int64
 }
 
 // Engine represents the core memory queue system for the brute-forcer.
 type Engine struct {
+	RunID         int64
 	jobs          chan Job
 	wg            sync.WaitGroup
 	filter        *bloom.BloomFilter
@@ -356,20 +359,79 @@ func (e *Engine) SetPaused(paused bool) {
 	e.Config.IsPaused = paused
 }
 
+// Restart restarts the scanner with the current wordlist and new configurations.
+func (e *Engine) Restart() error {
+	e.Config.RLock()
+	path := e.Config.WordlistPath
+	e.Config.RUnlock()
+
+	if path == "" {
+		return fmt.Errorf("no wordlist currently loaded to restart")
+	}
+
+	return e.ChangeWordlist(path)
+}
+
 // ChangeWordlist cancels the current scanner and starts a new one with the given path.
 func (e *Engine) ChangeWordlist(path string) error {
+	// Verify that the new wordlist exists and is accessible before stopping the current one
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("wordlist file does not exist: %s", path)
+	}
+
 	// Stop existing scanner
 	e.scannerCancel()
+
+	// Reset Bloom filter so we can safely re-scan the same payloads
+	e.filterLock.Lock()
+	e.filter = bloom.NewWithEstimates(10000000, 0.001)
+	e.filterLock.Unlock()
+
+	// Reset counters
+	atomic.StoreInt64(&e.ProcessedLines, 0)
+	atomic.StoreInt64(&e.TotalLines, 0)
+	atomic.StoreInt64(&e.Count200, 0)
+	atomic.StoreInt64(&e.Count403, 0)
+	atomic.StoreInt64(&e.Count404, 0)
+	atomic.StoreInt64(&e.Count429, 0)
+	atomic.StoreInt64(&e.Count500, 0)
+	atomic.StoreInt64(&e.CountConnErr, 0)
+
+	// Reset auto-filter tracker
+	e.fpMutex.Lock()
+	e.fpCounts = make(map[string]int)
+	e.fpMutex.Unlock()
+
 	// Wait for the old scanner to finish/cleanup if necessary,
 	// but since we just want to start a new one, we can just re-initialize context.
+
+	// Drain any incredibly fast pending jobs from the old queue
+	// that didn't get cancelled fast enough
+drainLoop:
+	for {
+		select {
+		case <-e.jobs:
+			// Purge leftover job from channel queue
+			e.activeJobs.Done()
+		default:
+			break drainLoop
+		}
+	}
 
 	// Create new context
 	e.scannerCtx, e.scannerCancel = context.WithCancel(context.Background())
 
+	atomic.AddInt64(&e.RunID, 1)
+
 	// Start new scanner
-	e.AddScanner()
-	go e.StartWordlistScanner(path)
+	e.KickoffScanner(path)
 	return nil
+}
+
+// KickoffScanner starts the wordlist scanner safely attached to the current context generation.
+func (e *Engine) KickoffScanner(path string) {
+	e.AddScanner()
+	go e.StartWordlistScanner(e.scannerCtx, atomic.LoadInt64(&e.RunID), path)
 }
 
 // AddScanner increments the scanner waitgroup.
@@ -378,7 +440,7 @@ func (e *Engine) AddScanner() {
 }
 
 // StartWordlistScanner reads from a Wordlist and submits payloads to the engine.
-func (e *Engine) StartWordlistScanner(path string) {
+func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path string) {
 	defer e.scannerWg.Done()
 	// Remember path for recursion
 	e.Config.Lock()
@@ -387,7 +449,13 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 	file, err := os.Open(path)
 	if err != nil {
-		fmt.Printf("Error opening wordlist: %v\n", err)
+		// Communicate the file error back without corrupting the TUI using fmt.Printf
+		e.Results <- Result{
+			Path:         path,
+			StatusCode:   0,
+			IsAutoFilter: true, // Reuse the auto filter styling as a system notification
+			Headers:      map[string]string{"Msg": "Error opening wordlist: " + err.Error()},
+		}
 		atomic.StoreInt64(&e.TotalLines, 0)
 		return
 	}
@@ -406,6 +474,13 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
+		// Stop counting instantly if cancelled
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
 		line := scanner.Text()
 		if line == "" {
 			continue
@@ -440,7 +515,7 @@ func (e *Engine) StartWordlistScanner(path string) {
 	for scanner.Scan() {
 		// Respect cancellation (e.g. from ChangeWordlist)
 		select {
-		case <-e.scannerCtx.Done():
+		case <-ctx.Done():
 			return
 		default:
 			// Check for pause
@@ -455,7 +530,7 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 				// Also check cancellation while paused
 				select {
-				case <-e.scannerCtx.Done():
+				case <-ctx.Done():
 					return
 				default:
 				}
@@ -488,7 +563,7 @@ func (e *Engine) StartWordlistScanner(path string) {
 
 				for _, method := range methodsToUse {
 					// 1. Send Base
-					e.Submit(Job{Path: line, Depth: 0, Method: method})
+					e.Submit(Job{Path: line, Depth: 0, Method: method, RunID: runID})
 
 					// 2. Send Extensions
 					for _, ext := range exts {
@@ -497,7 +572,7 @@ func (e *Engine) StartWordlistScanner(path string) {
 						if !strings.HasPrefix(cleanExt, ".") {
 							cleanExt = "." + cleanExt
 						}
-						e.Submit(Job{Path: line + cleanExt, Depth: 0, Method: method})
+						e.Submit(Job{Path: line + cleanExt, Depth: 0, Method: method, RunID: runID})
 					}
 				}
 			}
@@ -688,6 +763,13 @@ func (e *Engine) worker(id int) {
 	defer e.wg.Done()
 
 	for job := range e.jobs {
+		// Drop immediately if job belongs to a generation that was cancelled.
+		// Ensures old jobs never process or increment counters for a new scan.
+		if job.RunID != atomic.LoadInt64(&e.RunID) {
+			e.activeJobs.Done()
+			continue
+		}
+
 		var doRecurse bool
 		var maxDepth int
 		var wordlistPath string
@@ -1002,13 +1084,13 @@ func (e *Engine) worker(id int) {
 				// Requirement: "if the discovered path contains a file extension (using filepath.Ext(path) or checking for a .)"
 				if strings.Contains(payload, ".") {
 					// Launch in goroutine to avoid blocking the worker on channel send
-					go func(basePath string, method string) {
+					go func(runID int64, basePath string, method string) {
 						// Required mutations: path + ".bak", path + ".old", path + ".save", path + "~", and path + ".swp"
 						mutations := []string{".bak", ".old", ".save", "~", ".swp"}
 						for _, m := range mutations {
-							e.Submit(Job{Path: basePath + m, Depth: depth, Method: method})
+							e.Submit(Job{Path: basePath + m, Depth: depth, Method: method, RunID: runID})
 						}
-					}(payload, job.Method)
+					}(job.RunID, payload, job.Method)
 				}
 			}
 		}
@@ -1037,7 +1119,7 @@ func (e *Engine) worker(id int) {
 			// We spawn a goroutine to read the wordlist and queue jobs
 			// This part is CPU/Disk bound, not Network bound, so it's fine to be async to keep the worker free.
 			e.AddScanner()
-			go func(basePath string, nextDepth int, wlPath string) {
+			go func(runID int64, basePath string, nextDepth int, wlPath string) {
 				defer e.scannerWg.Done()
 				f, err := os.Open(wlPath)
 				if err != nil {
@@ -1084,10 +1166,10 @@ func (e *Engine) worker(id int) {
 					for _, method := range methodsToUse {
 						// Update TotalLines because recursive jobs extend the scan
 						atomic.AddInt64(&e.TotalLines, 1)
-						e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method})
+						e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method, RunID: runID})
 					}
 				}
-			}(payload, depth+1, wordlistPath)
+			}(job.RunID, payload, depth+1, wordlistPath)
 		}
 
 	nextJob:
@@ -1101,6 +1183,11 @@ func (e *Engine) worker(id int) {
 
 // Submit adds a payload to the queue if it passes the Bloom filter check.
 func (e *Engine) Submit(job Job) {
+	// Drop job immediately if it belongs to a cancelled scan generation
+	if job.RunID != atomic.LoadInt64(&e.RunID) {
+		return
+	}
+
 	// The Bloom filter is not thread-safe for concurrent writes by default.
 	// We lock it to ensure safe concurrent submissions if there are multiple producers.
 	e.filterLock.Lock()
@@ -1130,4 +1217,22 @@ func (e *Engine) Wait() {
 	close(e.jobs)
 	e.wg.Wait()
 	close(e.Results)
+}
+
+type EngineConfigDump struct {
+	Target     string
+	Wordlist   string
+	OutputFile string
+	SmartAPI   bool
+}
+
+func (e *Engine) DumpMeta() EngineConfigDump {
+	e.Config.RLock()
+	defer e.Config.RUnlock()
+	return EngineConfigDump{
+		Target:     e.baseURL,
+		Wordlist:   e.Config.WordlistPath,
+		OutputFile: e.Config.OutputFile,
+		SmartAPI:   e.Config.SmartAPI,
+	}
 }

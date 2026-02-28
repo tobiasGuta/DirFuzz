@@ -146,6 +146,7 @@ func NewModel(eng *engine.Engine, initialWorkers int) Model {
 	// Initialize Help Viewport with default content
 	hv := viewport.New(0, 0)
 	helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS (Use arrow keys to scroll):") + "\n" +
+		":run                  - Restart scan with current configs\n" +
 		":set-ua [Agent]       - Set User-Agent\n" +
 		":add-header [K]: [V]  - Set Header\n" +
 		":rm-header [K]        - Remove Header\n" +
@@ -190,7 +191,7 @@ func (m Model) renderTelemetryContent() string {
 	}
 
 	// Fetch current config for display
-	ua, filters, _, delay, extensions := m.Engine.ConfigSnapshot()
+	ua, filters, headers, delay, extensions := m.Engine.ConfigSnapshot()
 	sort.Ints(filters)
 	filtersStr := "None"
 	if len(filters) > 0 {
@@ -198,32 +199,34 @@ func (m Model) renderTelemetryContent() string {
 		for i, v := range filters {
 			strs[i] = strconv.Itoa(v)
 		}
-		// Truncate list if too long
-		if len(strs) > 5 {
-			filtersStr = strings.Join(strs[:5], ",") + "..."
-		} else {
-			filtersStr = strings.Join(strs, ",")
-		}
-	} else {
-		// Default when empty
-		filtersStr = "None"
+		filtersStr = strings.Join(strs, ",")
 	}
 
 	extentionsStr := "None"
 	if len(extensions) > 0 {
-		// Truncate list if too long
-		if len(extensions) > 5 {
-			extentionsStr = strings.Join(extensions[:5], ",") + "..."
-		} else {
-			extentionsStr = strings.Join(extensions, ",")
+		extentionsStr = strings.Join(extensions, ",")
+	}
+
+	headersBlock := "             [Headers: None]"
+	if len(headers) > 0 {
+		var hList []string
+		for k, v := range headers {
+			if k != "User-Agent" { // User-Agent is already shown elsewhere usually
+				hList = append(hList, fmt.Sprintf("%s:%s", k, v))
+			}
+		}
+		sort.Strings(hList)
+		if len(hList) > 0 {
+			var formattedHeaders []string
+			for _, h := range hList {
+				styledHeader := lipgloss.NewStyle().Foreground(draculaGreen).Render(h)
+				formattedHeaders = append(formattedHeaders, fmt.Sprintf("             [Headers: %s]", styledHeader))
+			}
+			headersBlock = strings.Join(formattedHeaders, "\n")
 		}
 	}
 
-	// Truncate UA for display
 	displayUA := ua
-	if len(displayUA) > 25 {
-		displayUA = displayUA[:22] + "..."
-	}
 
 	// Left Side: Telemetry
 	telemetryLeft := fmt.Sprintf(
@@ -234,8 +237,10 @@ func (m Model) renderTelemetryContent() string {
 			"RPS:         %s\n"+
 			"Params:      [Delay: %s]\n"+
 			"Queue Size:  %s\n\n"+
-			"Config:      [UA: %s] [Filter Sizes: %s]\n"+
+			"Config:      [UA: %s]\n"+
+			"             [Filter Sizes: %s]\n"+
 			"             [Ext: %s]\n"+
+			"%s\n\n"+
 			"Errors:      [Conn: %s] [403: %s]  [429: %s]  [500: %s]\n\n"+
 			"Controls:    [Tab] Switch Focus  [p] Pause/Resume  [:] Command",
 		titleStyle.Render("DirFuzz Telemetry"),
@@ -248,6 +253,7 @@ func (m Model) renderTelemetryContent() string {
 		lipgloss.NewStyle().Foreground(draculaOrange).Render(displayUA),
 		lipgloss.NewStyle().Foreground(draculaYellow).Render(filtersStr),
 		lipgloss.NewStyle().Foreground(draculaPurple).Render(extentionsStr),
+		headersBlock,
 		errStyle.Render(fmt.Sprintf("%d", m.ErrConn)),
 		warnStyle.Render(fmt.Sprintf("%d", m.Err403)),
 		warnStyle.Render(fmt.Sprintf("%d", m.Err429)),
@@ -332,7 +338,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					// Full width for viewport when leaving command mode
 					m.Viewport.Width = m.Width - 4
-					m.Viewport.SetContent(m.renderTelemetryContent())
+					m.updateTelemetry()
 					m.Viewport.GotoTop()
 					return m, nil
 				}
@@ -354,21 +360,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.Paused = false
 					// Full width for viewport
 					m.Viewport.Width = m.Width - 4
-					m.Viewport.SetContent(m.renderTelemetryContent())
+					m.updateTelemetry()
 					m.Viewport.GotoTop()
 				} else {
 					// Stay in Command Mode for chaining
 					m.TextInput.SetValue("") // Clear input for next command
 
 					// Update view so user sees the change (e.g. added header)
-					m.Viewport.SetContent(m.renderTelemetryContent())
+					m.updateTelemetry()
 
 					// If help was shown, scroll to bottom so they see it
 					if isHelp {
-						// Help is already shown in side panel, scroll that?
-						// Or maybe force show help panel?
-						// We are always showing help panel in command mode now.
 						m.HelpViewport.GotoTop()
+					} else {
+						m.Viewport.GotoBottom()
 					}
 					// Keep suggestions cleared until typing starts again
 					m.Suggestions = []CommandDef{}
@@ -386,13 +391,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.Suggestions = []CommandDef{}
 				// Full width for viewport
 				m.Viewport.Width = m.Width - 4
-				m.Viewport.SetContent(m.renderTelemetryContent())
+				m.updateTelemetry()
 
 			case tea.KeyTab:
 				// Autocomplete
 				if len(m.Suggestions) > 0 {
 					selected := m.Suggestions[m.SuggestionIndex]
-					m.TextInput.SetValue(selected.Name + " ")
+					val := selected.Name
+					if !strings.HasSuffix(val, string(os.PathSeparator)) {
+						val += " "
+					}
+					m.TextInput.SetValue(val)
 					m.TextInput.CursorEnd()
 					m.Suggestions = []CommandDef{}
 				}
@@ -531,11 +540,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					helpWidth := (m.Width - 4) - telemetryWidth - 3
 
 					m.Viewport.Width = telemetryWidth
-					m.Viewport.SetContent(m.renderTelemetryContent())
+					m.updateTelemetry()
 
 					m.HelpViewport.Width = helpWidth
 					// Re-set help content to ensure proper wrapping if needed
 					helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS:") + "\n" +
+						":run                  - Restart scan with current configs\n" +
 						":set-ua [Agent]       - Set User-Agent\n" +
 						":add-header [K]: [V]  - Set Header\n" +
 						":rm-header [K]        - Remove Header\n" +
@@ -564,7 +574,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "p":
 				m.Paused = !m.Paused
 				m.Engine.SetPaused(m.Paused)
-				m.Viewport.SetContent(m.renderTelemetryContent())
+				m.updateTelemetry()
 			case "tab":
 				m.TopFocused = !m.TopFocused
 				return m, nil
@@ -612,6 +622,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle Mouse scrolling
+	case tea.MouseMsg:
+		var cmd tea.Cmd
+		if msg.Type == tea.MouseWheelUp || msg.Type == tea.MouseWheelDown {
+			if m.TopFocused {
+				m.Viewport, cmd = m.Viewport.Update(msg)
+			} else if m.CommandMode {
+				m.HelpViewport, cmd = m.HelpViewport.Update(msg)
+			}
+			return m, cmd
+		}
+
 	// Handle window resizing
 	case tea.WindowSizeMsg:
 		m.Width = msg.Width
@@ -646,12 +668,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Viewport = viewport.New(telemetryWidth, headerHeight)
 		m.Viewport.YPosition = 0
 		m.Viewport.HighPerformanceRendering = false
-		m.Viewport.SetContent(m.renderTelemetryContent())
+		m.updateTelemetry()
 
 		m.HelpViewport = viewport.New(helpWidth, headerHeight)
 		m.HelpViewport.SetContent(m.HelpViewport.View()) // Keeps content, update size
 		// Re-set help content to be safe
 		helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS:") + "\n" +
+			":run                  - Restart scan with current configs\n" +
 			":set-ua [Agent]       - Set User-Agent\n" +
 			":add-header [K]: [V]  - Set Header\n" +
 			":rm-header [K]        - Remove Header\n" +
@@ -675,7 +698,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Err403 = msg.Err403
 		m.Err429 = msg.Err429
 		m.Err500 = msg.Err500
-		m.Viewport.SetContent(m.renderTelemetryContent())
+		m.updateTelemetry()
 
 	// Handle incoming successful logs
 	case LogMsg:
@@ -701,7 +724,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.Err500 = int(atomic.LoadInt64(&m.Engine.Count500))
 		m.ErrConn = int(atomic.LoadInt64(&m.Engine.CountConnErr))
 
-		m.Viewport.SetContent(m.renderTelemetryContent()) // Should force viewport update
+		m.updateTelemetry() // Should force viewport update
 		return m, tickCmd()
 	}
 
@@ -718,6 +741,15 @@ func (m *Model) ExecuteCommand(raw string) error {
 	}
 
 	switch command {
+	case "run":
+		err := m.Engine.Restart()
+		if err != nil {
+			return fmt.Errorf("failed to restart: %v", err)
+		}
+		// Clear viewport results from previous run
+		m.Logs = []engine.Result{}
+		m.ScrollOffset = 0
+		m.StatusStr = "Scan restarted with updated configuration!"
 	case "set-ua":
 		if args == "" {
 			return fmt.Errorf("usage: :set-ua [value]")
@@ -729,7 +761,14 @@ func (m *Model) ExecuteCommand(raw string) error {
 			return fmt.Errorf("usage: :add-header Key: Value")
 		}
 		headerParts := strings.SplitN(args, ":", 2)
-		m.Engine.AddHeader(strings.TrimSpace(headerParts[0]), strings.TrimSpace(headerParts[1]))
+		key := strings.TrimSpace(headerParts[0])
+		val := strings.TrimSpace(headerParts[1])
+
+		// Check for duplicate header
+		if _, exists := m.Engine.Config.Headers[key]; exists {
+			return fmt.Errorf("header %s already exists", key)
+		}
+		m.Engine.AddHeader(key, val)
 	case "set-delay":
 		d, err := time.ParseDuration(strings.TrimSpace(args))
 		if err != nil {
@@ -820,9 +859,6 @@ func (m *Model) ExecuteCommand(raw string) error {
 			":wordlist [path]      - Hot-swap Wordlist\n" +
 			":run                  - Resume Scanning\n" +
 			":help                 - Show this menu"
-	case "run":
-		// Handled in Update loop, just return nil to avoid error
-		return nil
 	default:
 		return fmt.Errorf("unknown command")
 	}
@@ -1008,4 +1044,25 @@ func (m Model) View() string {
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, topBox, bottomBox)
+}
+
+func (m *Model) updateTelemetry() {
+	if m.Width == 0 || m.Height == 0 {
+		return
+	}
+	content := m.renderTelemetryContent()
+
+	newHeight := lipgloss.Height(content)
+	maxTopHeight := int(float64(m.Height) * 0.75)
+	if newHeight > maxTopHeight {
+		newHeight = maxTopHeight
+	}
+	if newHeight < 10 {
+		newHeight = 10
+	}
+
+	m.Viewport.Height = newHeight
+	y := m.Viewport.YOffset
+	m.Viewport.SetContent(content)
+	m.Viewport.YOffset = y
 }
