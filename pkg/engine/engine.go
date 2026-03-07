@@ -57,6 +57,7 @@ type Engine struct {
 	filter        *bloom.BloomFilter
 	filterLock    sync.Mutex
 	numWorkers    int
+	targetLock    sync.RWMutex
 	baseURL       string
 	host          string
 	Config        *Config
@@ -586,13 +587,32 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 
 // SetTarget sets the target URL and extracts the host for raw requests.
 func (e *Engine) SetTarget(targetURL string) error {
+	// Support both upper and lower case payload markers
+	targetURL = strings.ReplaceAll(targetURL, "{payload}", "{PAYLOAD}")
+
 	u, err := url.Parse(targetURL)
 	if err != nil {
 		return err
 	}
+	e.targetLock.Lock()
 	e.baseURL = targetURL
 	e.host = u.Host
+	e.targetLock.Unlock()
 	return nil
+}
+
+// BaseURL returns the current target URL in a thread-safe manner.
+func (e *Engine) BaseURL() string {
+	e.targetLock.RLock()
+	defer e.targetLock.RUnlock()
+	return e.baseURL
+}
+
+// Host returns the current target host in a thread-safe manner.
+func (e *Engine) Host() string {
+	e.targetLock.RLock()
+	defer e.targetLock.RUnlock()
+	return e.host
 }
 
 // AutoCalibrate attempts to detect wildcard responses.
@@ -616,18 +636,18 @@ func (e *Engine) AutoCalibrate() error {
 				"Accept: */*\r\n"+
 				"\r\n",
 			path,
-			e.host,
+			e.Host(),
 			e.Config.UserAgent,
 		))
 
-		// IMPORTANT: Ensure request to e.baseURL (full URL)
+		// IMPORTANT: Ensure request to e.BaseURL() (full URL)
 		// Auto calibration uses direct connection or proxy if loaded
 		var proxyAddr string
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
 		}
 
-		resp, err := httpclient.SendRawRequest(e.baseURL, rawRequest, 5*time.Second, proxyAddr)
+		resp, err := httpclient.SendRawRequest(e.BaseURL(), rawRequest, 5*time.Second, proxyAddr)
 		if err != nil {
 			return fmt.Errorf("calibration request failed: %v", err)
 		}
@@ -689,7 +709,7 @@ func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
 			"Accept: */*\r\n"+
 			"\r\n",
 		randPath,
-		e.host,
+		e.Host(),
 		e.Config.UserAgent,
 	))
 
@@ -699,7 +719,7 @@ func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
 	if e.proxyDialer {
 		proxyAddr = e.GetNextProxy()
 	}
-	resp, err := httpclient.SendRawRequest(e.baseURL, rawRequest, 3*time.Second, proxyAddr)
+	resp, err := httpclient.SendRawRequest(e.BaseURL(), rawRequest, 3*time.Second, proxyAddr)
 	if err != nil {
 		// If probe fails (timeout/connRefused), assume safe to proceed?
 		// Or assume unstable. Let's assume safe, since wildcard usually means active server.
@@ -842,14 +862,19 @@ func (e *Engine) worker(id int) {
 		// Construct the full URL
 		var fullURL string
 		word := payload
-		if strings.Contains(e.baseURL, "{PAYLOAD}") {
-			fullURL = strings.Replace(e.baseURL, "{PAYLOAD}", word, 1)
+
+		e.targetLock.RLock()
+		currentBaseURL := e.baseURL
+		e.targetLock.RUnlock()
+
+		if strings.Contains(currentBaseURL, "{PAYLOAD}") {
+			fullURL = strings.Replace(currentBaseURL, "{PAYLOAD}", word, 1)
 		} else {
 			// Ensure word starts with /
 			if !strings.HasPrefix(word, "/") {
 				word = "/" + word
 			}
-			fullURL = strings.TrimRight(e.baseURL, "/") + word
+			fullURL = strings.TrimRight(currentBaseURL, "/") + word
 		}
 
 		parsedURL, errURL := url.Parse(fullURL)
@@ -872,7 +897,7 @@ func (e *Engine) worker(id int) {
 			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 
-		target = e.baseURL
+		target = currentBaseURL
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
 		}
@@ -1238,7 +1263,7 @@ func (e *Engine) DumpMeta() EngineConfigDump {
 	e.Config.RLock()
 	defer e.Config.RUnlock()
 	return EngineConfigDump{
-		Target:     e.baseURL,
+		Target:     e.BaseURL(),
 		Wordlist:   e.Config.WordlistPath,
 		OutputFile: e.Config.OutputFile,
 		SmartAPI:   e.Config.SmartAPI,

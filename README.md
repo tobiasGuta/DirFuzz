@@ -89,6 +89,8 @@ dirfuzz -h
 ./dirfuzz -url http://localhost:3000/api/{PAYLOAD}/users -wordlist wordlist.txt -W 10
 ```
 
+*Note: The tool supports both uppercase `{PAYLOAD}` and lowercase `{payload}`. The current URL and payload injection point are continuously visible in the top TUI Telemetry view. You can also hot-swap the payload target during a live scan using the `:set-url` command without restarting the tool.*
+
 ### Command Line Flags
 
 | Flag | Description | Default |
@@ -130,6 +132,7 @@ Press `:` to enter command mode. The scanner will pause while you type.
 
 | Command | Usage | Description |
 |---------|-------|-------------|
+| `:set-url` | `:set-url [URL]` | Changes the target URL (supports updating `{payload}` locations on the fly). |
 | `:worker` | `:worker [int]` | Set the number of concurrent workers. |
 | `:set-ua` | `:set-ua [string]` | Set a custom User-Agent string. |
 | `:add-header` | `:add-header [Key]: [Value]` | Add a custom HTTP header. Ensures duplicate headers are safely rejected. |

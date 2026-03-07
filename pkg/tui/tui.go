@@ -121,6 +121,7 @@ type CommandDef struct {
 // AvailableCommands is the static list of all commands
 var AvailableCommands = []CommandDef{
 	{Name: "worker", Description: "Set worker count", Usage: ":worker [int]"},
+	{Name: "set-url", Description: "Set target URL", Usage: ":set-url [URL]"},
 	{Name: "set-ua", Description: "Set User-Agent string", Usage: ":set-ua [AgentString]"},
 	{Name: "set-delay", Description: "Set request delay", Usage: ":set-delay [10ms|1s]"},
 	{Name: "add-header", Description: "Add custom HTTP header", Usage: ":add-header [Key]: [Value]"},
@@ -229,8 +230,10 @@ func (m Model) renderTelemetryContent() string {
 	displayUA := ua
 
 	// Left Side: Telemetry
+	targetURL := m.Engine.BaseURL()
 	telemetryLeft := fmt.Sprintf(
 		"%s\n\n"+
+			"Target URL:  %s\n"+
 			"Status:      %s\n"+
 			"Workers:     %s (Press L/R or :worker)\n"+
 			"Progress:    %s\n"+
@@ -244,6 +247,7 @@ func (m Model) renderTelemetryContent() string {
 			"Errors:      [Conn: %s] [403: %s]  [429: %s]  [500: %s]\n\n"+
 			"Controls:    [Tab] Switch Focus  [p] Pause/Resume  [:] Command",
 		titleStyle.Render("DirFuzz Telemetry"),
+		lipgloss.NewStyle().Foreground(draculaPink).Render(targetURL),
 		status,
 		infoStyle.Render(fmt.Sprintf("%d", m.Workers)),
 		lipgloss.NewStyle().Foreground(draculaCyan).Render(fmt.Sprintf("%d/%d", m.ProgressCurrent, m.ProgressTotal)),
@@ -546,6 +550,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Re-set help content to ensure proper wrapping if needed
 					helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS:") + "\n" +
 						":run                  - Restart scan with current configs\n" +
+						":set-url [URL]        - Set Target URL\n" +
 						":set-ua [Agent]       - Set User-Agent\n" +
 						":add-header [K]: [V]  - Set Header\n" +
 						":rm-header [K]        - Remove Header\n" +
@@ -750,6 +755,14 @@ func (m *Model) ExecuteCommand(raw string) error {
 		m.Logs = []engine.Result{}
 		m.ScrollOffset = 0
 		m.StatusStr = "Scan restarted with updated configuration!"
+	case "set-url":
+		if args == "" {
+			return fmt.Errorf("usage: :set-url [URL]")
+		}
+		if err := m.Engine.SetTarget(args); err != nil {
+			return fmt.Errorf("invalid URL: %v", err)
+		}
+		m.StatusStr = fmt.Sprintf("URL updated to %s", args)
 	case "set-ua":
 		if args == "" {
 			return fmt.Errorf("usage: :set-ua [value]")
