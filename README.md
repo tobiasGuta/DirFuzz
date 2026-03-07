@@ -11,6 +11,7 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 
 - **High Concurrency**: Tunable worker pool for scanning.
 - **Interactive TUI**: View real-time progress, modify settings on the fly, and manage filters without restarting.
+- **Redirect Detection**: Automatically extracts and displays the `Location` header for `30x` responses natively in the dashboard output (`-> /redirect_url`).
 - **Smart Filtering**:
   - **Auto-Calibration**: Detects wildcard responses based on consistency.
   - **Auto-Filter**: Automatically identifies and blocks repetitive responses (e.g., custom 404 pages returning 200 OK) during the scan.

@@ -1009,10 +1009,16 @@ func (m Model) View() string {
 			}
 			methodFmt := lipgloss.NewStyle().Foreground(draculaPurple).Render(fmt.Sprintf("[%s]", methodStr))
 
-			line := fmt.Sprintf("%s %s %s %s %s%s %s%s",
+			redirectFmt := ""
+			if res.Redirect != "" {
+				redirectFmt = lipgloss.NewStyle().Foreground(draculaYellow).Render(fmt.Sprintf(" -> %s", res.Redirect))
+			}
+
+			line := fmt.Sprintf("%s %s %s%s %s %s%s %s%s",
 				prefix,
 				methodFmt,
 				pathStyle.Render(res.Path),
+				redirectFmt,
 				lipgloss.NewStyle().Foreground(draculaComment).Render("(Status:"),
 				statusStr,
 				changeInfo,

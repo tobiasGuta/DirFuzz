@@ -103,6 +103,7 @@ type Result struct {
 	Method        string            `json:"method,omitempty"`
 	StatusCode    int               `json:"status"`
 	Size          int               `json:"length"`
+	Redirect      string            `json:"redirect,omitempty"`    // Redirect location if applicable
 	Headers       map[string]string `json:"headers,omitempty"`     // Captured interesting headers
 	IsEagleAlert  bool              `json:"eagle_alert,omitempty"` // Flag for state changes
 	OldStatusCode int               `json:"old_status,omitempty"`  // Previous status code (if Eagle Alert)
@@ -112,6 +113,9 @@ type Result struct {
 // String returns a string representation of the result for CLI output.
 func (r Result) String() string {
 	extras := ""
+	if r.Redirect != "" {
+		extras += fmt.Sprintf(" -> %s", r.Redirect)
+	}
 	if val, ok := r.Headers["Server"]; ok {
 		extras += fmt.Sprintf(" [Server: %s]", val)
 	}
@@ -1058,6 +1062,10 @@ func (e *Engine) worker(id int) {
 			StatusCode: resp.StatusCode,
 			Size:       bodySize,
 			Headers:    capturedHeaders,
+		}
+
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			result.Redirect = resp.GetHeader("Location")
 		}
 
 		// Eagle Mode Check
