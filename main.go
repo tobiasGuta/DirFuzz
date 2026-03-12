@@ -1,11 +1,12 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -17,263 +18,393 @@ import (
 )
 
 func main() {
-	// Parse command line flags
-	targetURL := flag.String("url", "", "Target URL to fuzz (e.g., http://localhost:3000)")
-	wordlistPath := flag.String("wordlist", "", "Path to the wordlist file")
-	matchCodesStr := flag.String("mc", "200,204,301,302,307,401,403", "Match Status Codes (comma-separated)")
-	filterSizesStr := flag.String("fs", "", "Filter Body Sizes (comma-separated)")
-	delayStr := flag.String("delay", "0ms", "Delay between requests (e.g., 10ms, 1s)")
-	recursive := flag.Bool("recursive", false, "Enable recursive fuzzing")
-	depth := flag.Int("depth", 3, "Max recursion depth")
-	runTUI := flag.Bool("tui", true, "Enable TUI mode")
-	cliMode := flag.Bool("cli", false, "Run in CLI mode (stdout only, disables TUI)")
-	outputFile := flag.String("o", "", "Output valid hits to a file (JSONL format)")
-	projectFlag := flag.String("project", "default", "Project name for logging/isolation")
-	eagleFlag := flag.String("eagle", "", "Path to previous scan for differential comparison")
-	proxyListFlag := flag.String("proxies", "", "Path to SOCKS5 proxy list")
-	extFlag := flag.String("ext", "", "Extensions to append (comma-separated, e.g., php,txt)")
-	mutateFlag := flag.Bool("mutate", false, "Enable smart mutation for file backups")
-	methodFlag := flag.String("X", "", "HTTP Method(s) to use (comma-separated, e.g., GET,POST)")
-	smartAPIFlag := flag.Bool("smart-api", false, "Intelligently apply methods only to likely API paths")
-	workersFlag := flag.Int("W", 100, "Number of concurrent workers")
+	// Required
+	target := flag.String("u", "", "Target URL (use {PAYLOAD} for injection point)")
+	wordlist := flag.String("w", "", "Path to wordlist file")
 
-	// Custom Usage message to include TUI commands
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		flag.PrintDefaults()
-		fmt.Fprintln(os.Stderr, "\nTUI Commands (Internal):")
-		fmt.Fprintln(os.Stderr, "  :set-ua [AgentString]    Set User-Agent string")
-		fmt.Fprintln(os.Stderr, "  :add-header [Key]: [Val] Add custom HTTP header")
-		fmt.Fprintln(os.Stderr, "  :rm-header [Key]         Remove custom HTTP header")
-		fmt.Fprintln(os.Stderr, "  :set-delay [duration]    Set request delay")
-		fmt.Fprintln(os.Stderr, "  :filter-size [bytes]     Filter response size")
-		fmt.Fprintln(os.Stderr, "  :wordlist [path]         Hot-swap wordlist file")
-		fmt.Fprintln(os.Stderr, "  :help                    Show available commands")
-	}
+	// Basic options
+	threads := flag.Int("t", 50, "Number of concurrent threads")
+	delay := flag.Int("delay", 0, "Delay between requests in ms (per-worker)")
+	userAgent := flag.String("ua", "DirFuzz/2.0", "User-Agent string")
+
+	// Status code matching
+	matchCodesStr := flag.String("mc", "200,204,301,302,307,308,401,403,405,500", "Match HTTP status codes (comma-separated)")
+	filterSizesStr := flag.String("fs", "", "Filter response sizes (comma-separated)")
+
+	// Body matching/filtering
+	matchRegex := flag.String("mr", "", "Match body regex pattern")
+	filterRegex := flag.String("fr", "", "Filter body regex pattern")
+	filterWords := flag.Int("fw", -1, "Filter responses with exact word count (-1 = off)")
+	filterLines := flag.Int("fl", -1, "Filter responses with exact line count (-1 = off)")
+	matchWords := flag.Int("mw", -1, "Match responses with exact word count (-1 = off)")
+	matchLines := flag.Int("ml", -1, "Match responses with exact line count (-1 = off)")
+
+	// Extensions & mutation
+	extensions := flag.String("e", "", "Extensions to append (comma-separated, e.g. php,html,js)")
+	mutate := flag.Bool("mutate", false, "Enable smart mutation (.bak, .old, .save, etc.)")
+
+	// Recursive scanning
+	recursive := flag.Bool("r", false, "Enable recursive scanning")
+	maxDepth := flag.Int("depth", 3, "Max recursion depth")
+
+	// Method fuzzing
+	methods := flag.String("m", "", "HTTP methods to fuzz (comma-separated, e.g. GET,POST,PUT,DELETE)")
+	smartAPI := flag.Bool("smart-api", false, "Only use multi-method for API-like paths")
+	requestBody := flag.String("d", "", "Request body for POST/PUT/PATCH (use {PAYLOAD} for injection)")
+
+	// Redirect handling
+	followRedirects := flag.Bool("follow", false, "Follow HTTP redirects")
+	maxRedirects := flag.Int("max-redirects", 5, "Maximum redirects to follow")
+
+	// Proxy
+	proxyFile := flag.String("proxy", "", "File containing SOCKS5 proxy list")
+
+	// Eagle Mode
+	eagleScan := flag.String("eagle", "", "Previous scan file for differential comparison")
+
+	// Output
+	outputFile := flag.String("o", "", "Output file path (default: scans/<hostname>/scan_<timestamp>.<format>)")
+	outputFormat := flag.String("of", "jsonl", "Output format: jsonl, csv, url")
+	noTUI := flag.Bool("no-tui", false, "Disable TUI, print results to stdout")
+
+	// Auto-calibrate
+	autoCalibrate := flag.Bool("ac", false, "Auto-calibrate to detect wildcard responses")
+
+	// Resume
+	resumeFile := flag.String("resume", "", "Resume from a previous scan state file")
+
+	// Multiple targets
+	urlsFile := flag.String("urls", "", "File containing target URLs (one per line)")
 
 	flag.Parse()
 
-	// Handle implicit help command via argument
-	if len(flag.Args()) > 0 && (flag.Arg(0) == "help" || flag.Arg(0) == ":help") {
-		flag.Usage()
-		os.Exit(0)
-	}
-
-	if *targetURL == "" {
-		fmt.Println("Error: -url flag is required")
-		flag.Usage()
+	// Validate required args
+	if *target == "" && *urlsFile == "" && *resumeFile == "" {
+		fmt.Println("Usage: dirfuzz -u <URL> -w <wordlist> [options]")
+		fmt.Println("       dirfuzz -urls <file> -w <wordlist> [options]")
+		fmt.Println()
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	// Parse the URL to get the host for the raw request
-	parsedURL, err := url.Parse(*targetURL)
-	if err != nil || parsedURL.Host == "" {
-		fmt.Println("Error: Invalid URL provided")
+	if *wordlist == "" && *resumeFile == "" {
+		fmt.Println("Error: -w <wordlist> is required")
 		os.Exit(1)
 	}
 
-	fmt.Println("Starting DirFuzz Engine...")
-
-	// Configuration
-	numWorkers := *workersFlag
-	expectedItems := uint(10_000_000) // 10 million payloads
-	falsePositiveRate := 0.001        // 0.1% false positive rate
-
-	// Initialize the engine
-	eng := engine.NewEngine(numWorkers, expectedItems, falsePositiveRate)
-
-	// Configure initial delay
-	if *delayStr != "" && *delayStr != "0ms" {
-		if d, err := time.ParseDuration(*delayStr); err == nil {
-			eng.SetDelay(d)
-		} else {
-			fmt.Printf("Warning: Invalid delay format %s. Using 0ms.\n", *delayStr)
-		}
-	}
-
-	// Configure Target
-	if err := eng.SetTarget(*targetURL); err != nil {
-		fmt.Printf("Error setting target: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Verify wordlist exists before starting anything
-	if *wordlistPath != "" {
-		if _, err := os.Stat(*wordlistPath); os.IsNotExist(err) {
-			fmt.Printf("Error: Wordlist file '%s' does not exist.\n", *wordlistPath)
-			os.Exit(1)
-		}
-	}
-
-	// Helper to parse comma-separated integers
-	parseInts := func(s string) []int {
-		var nums []int
-		if s == "" {
-			return nums
-		}
-		parts := strings.Split(s, ",")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if n, err := strconv.Atoi(part); err == nil {
-				nums = append(nums, n)
-			}
-		}
-		return nums
-	}
-
-	// Configure Filters
-	mc := parseInts(*matchCodesStr)
-	fs := parseInts(*filterSizesStr)
-	eng.ConfigureFilters(mc, fs)
-
-	// Set Recursive settings
-	eng.Config.Recursive = *recursive
-	eng.Config.MaxDepth = *depth
-
-	// Extensions
-	if *extFlag != "" {
-		exts := strings.Split(*extFlag, ",")
-		eng.Config.Extensions = exts
-		fmt.Printf("[*] Extensions loaded: %v\n", exts)
-	}
-
-	// Mutation
-	eng.Config.Mutate = *mutateFlag
-	if *mutateFlag {
-		fmt.Println("[*] Smart Mutation enabled")
-	}
-
-	// Smart API Method Fuzzer
-	if *methodFlag != "" {
-		eng.Config.Methods = strings.Split(*methodFlag, ",")
-		for i := range eng.Config.Methods {
-			eng.Config.Methods[i] = strings.TrimSpace(strings.ToUpper(eng.Config.Methods[i]))
-		}
-	}
-	eng.Config.SmartAPI = *smartAPIFlag
-	if len(eng.Config.Methods) > 0 {
-		fmt.Printf("[*] Methods loaded: %v (Smart API: %v)\n", eng.Config.Methods, eng.Config.SmartAPI)
-	}
-
-	// Proxies
-	if *proxyListFlag != "" {
-		if err := eng.LoadProxies(*proxyListFlag); err != nil {
-			fmt.Printf("Error loading proxy list: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	// Auto-Calibrate (detect wildcards)
-	fmt.Println("[*] Auto-calibrating...")
-	if err := eng.AutoCalibrate(); err != nil {
-		fmt.Printf("[!] Calibration warning: %v\n", err)
-	}
-
-	// Start the worker pool
-	eng.Start()
-
-	// Start reading wordlist (if we have one on CLI)
-	if *wordlistPath != "" {
-		eng.KickoffScanner(*wordlistPath)
-	}
-
-	// Prepare output file (prioritizing -o if given, otherwise using project structure)
-	var outputEncoder *json.Encoder
-	var eagleEncoder *json.Encoder
-	var filename string
-
-	// Determine Project Directory for Eagle Mode logging
-	project := "default"
-	if *projectFlag != "" {
-		project = *projectFlag
-	}
-	scanDir := fmt.Sprintf("scans/%s", project)
-	if err := os.MkdirAll(scanDir, 0755); err != nil {
-		fmt.Printf("Error creating project directory: %v\n", err)
-	}
-
-	// Eagle Mode Setup
-	if *eagleFlag != "" {
-		fmt.Printf("[*] Loading Eagle Mode baseline: %s\n", *eagleFlag)
-		if err := eng.LoadPreviousScan(*eagleFlag); err != nil {
-			fmt.Printf("[!] Error loading previous scan: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Setup dedicated alert log
-		alertFile := fmt.Sprintf("%s/eagle_alerts.jsonl", scanDir)
-		af, err := os.OpenFile(alertFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// Build target list
+	var targets []string
+	if *urlsFile != "" {
+		data, err := os.ReadFile(*urlsFile)
 		if err != nil {
-			fmt.Printf("[!] Error creating alert log: %v\n", err)
-		} else {
-			eagleEncoder = json.NewEncoder(af)
-			// defer af.Close() // defer in loop/complex scope is tricky, but main is fine
-		}
-	}
-
-	if *outputFile != "" {
-		filename = *outputFile
-	} else {
-		// Default to project structure logs
-		// Generate timestamped filename
-		timestamp := time.Now().Format("2006-01-02_15-04-05")
-		filename = fmt.Sprintf("%s/scan_%s.jsonl", scanDir, timestamp)
-
-		if *cliMode {
-			fmt.Printf("[*] Logging results to: %s\n", filename)
-		}
-	}
-
-	eng.Config.OutputFile = filename
-	f, err := os.Create(filename)
-	if err != nil {
-		fmt.Printf("Error creating log file: %v\n", err)
-		os.Exit(1)
-	}
-	defer f.Close()
-	outputEncoder = json.NewEncoder(f)
-
-	// TUI Mode (Default unless -cli is passed)
-	if *runTUI && !*cliMode {
-		p := tea.NewProgram(tui.NewModel(eng, numWorkers), tea.WithAltScreen())
-
-		// Goroutine to funnel engine results to TUI
-		go func() {
-			for res := range eng.Results {
-				if outputEncoder != nil {
-					outputEncoder.Encode(res)
-				}
-				if res.IsEagleAlert && eagleEncoder != nil {
-					eagleEncoder.Encode(res)
-				}
-				p.Send(tui.LogMsg(res))
-			}
-		}()
-
-		if _, err := p.Run(); err != nil {
-			fmt.Printf("Error running TUI: %v\n", err)
+			fmt.Printf("Error reading URLs file: %v\n", err)
 			os.Exit(1)
 		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && (strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://")) {
+				targets = append(targets, line)
+			}
+		}
+		if len(targets) == 0 {
+			fmt.Println("Error: no valid URLs found in file")
+			os.Exit(1)
+		}
+	} else if *target != "" {
+		targets = []string{*target}
+	}
+
+	// Parse match codes
+	var matchCodes []int
+	if *matchCodesStr != "" {
+		for _, cs := range strings.Split(*matchCodesStr, ",") {
+			code, err := strconv.Atoi(strings.TrimSpace(cs))
+			if err != nil {
+				fmt.Printf("Invalid match code: %s\n", cs)
+				os.Exit(1)
+			}
+			matchCodes = append(matchCodes, code)
+		}
+	}
+
+	// Parse filter sizes
+	var filterSizes []int
+	if *filterSizesStr != "" {
+		for _, fs := range strings.Split(*filterSizesStr, ",") {
+			size, err := strconv.Atoi(strings.TrimSpace(fs))
+			if err != nil {
+				fmt.Printf("Invalid filter size: %s\n", fs)
+				os.Exit(1)
+			}
+			filterSizes = append(filterSizes, size)
+		}
+	}
+
+	// Parse extensions
+	var exts []string
+	if *extensions != "" {
+		for _, ext := range strings.Split(*extensions, ",") {
+			ext = strings.TrimSpace(ext)
+			if ext != "" {
+				exts = append(exts, ext)
+			}
+		}
+	}
+
+	// Parse methods
+	var methodList []string
+	if *methods != "" {
+		for _, m := range strings.Split(*methods, ",") {
+			m = strings.TrimSpace(strings.ToUpper(m))
+			if m != "" {
+				methodList = append(methodList, m)
+			}
+		}
+	}
+
+	// Run for each target
+	for i, tgt := range targets {
+		if len(targets) > 1 {
+			fmt.Printf("\n[*] Scanning target %d/%d: %s\n", i+1, len(targets), tgt)
+		}
+		runScan(tgt, *wordlist, *threads, *delay, *userAgent, matchCodes, filterSizes,
+			exts, methodList, *smartAPI, *requestBody, *mutate, *recursive, *maxDepth,
+			*proxyFile, *eagleScan, *outputFile, *outputFormat, *noTUI,
+			*autoCalibrate, *matchRegex, *filterRegex, *filterWords, *filterLines,
+			*matchWords, *matchLines, *followRedirects, *maxRedirects, *resumeFile)
+	}
+}
+
+func runScan(target, wordlist string, threads, delayMs int, userAgent string,
+	matchCodes, filterSizes []int, extensions, methods []string, smartAPI bool,
+	requestBody string, mutate, recursive bool, maxDepth int,
+	proxyFile, eagleScan, outputFile, outputFormat string, noTUI, autoCalibrate bool,
+	matchRegex, filterRegex string, filterWords, filterLines, matchWords, matchLines int,
+	followRedirects bool, maxRedirects int, resumeFile string) {
+
+	// Init engine
+	eng := engine.NewEngine(threads, 10_000_000, 0.001)
+	eng.ConfigureFilters(matchCodes, filterSizes)
+
+	// Set target
+	if err := eng.SetTarget(target); err != nil {
+		fmt.Printf("Error: invalid target URL: %v\n", err)
 		return
 	}
 
-	// CLI Mode: Print results to stdout
-	// We need to consume results in main thread or separate goroutine while waiting
+	// Apply config
+	eng.UpdateUserAgent(userAgent)
+	eng.SetDelay(time.Duration(delayMs) * time.Millisecond)
+
+	eng.Config.Lock()
+	eng.Config.Extensions = extensions
+	eng.Config.Methods = methods
+	eng.Config.SmartAPI = smartAPI
+	eng.Config.Mutate = mutate
+	eng.Config.Recursive = recursive
+	eng.Config.MaxDepth = maxDepth
+	eng.Config.FollowRedirects = followRedirects
+	eng.Config.MaxRedirects = maxRedirects
+	eng.Config.RequestBody = requestBody
+	eng.Config.FilterWords = filterWords
+	eng.Config.FilterLines = filterLines
+	eng.Config.MatchWords = matchWords
+	eng.Config.MatchLines = matchLines
+	eng.Config.OutputFormat = outputFormat
+	eng.Config.Unlock()
+
+	// Match/Filter regex
+	if matchRegex != "" {
+		if err := eng.SetMatchRegex(matchRegex); err != nil {
+			fmt.Printf("Error: invalid match regex: %v\n", err)
+			return
+		}
+	}
+	if filterRegex != "" {
+		if err := eng.SetFilterRegex(filterRegex); err != nil {
+			fmt.Printf("Error: invalid filter regex: %v\n", err)
+			return
+		}
+	}
+
+	// Resume support
+	if resumeFile != "" {
+		eng.ResumeFile = resumeFile
+		wl, _, err := eng.LoadResumeState(resumeFile)
+		if err != nil {
+			fmt.Printf("Error loading resume file: %v\n", err)
+			return
+		}
+		if wordlist == "" {
+			wordlist = wl
+		}
+		fmt.Printf("[*] Resuming from: %s\n", resumeFile)
+	}
+
+	// Load proxies
+	if proxyFile != "" {
+		if err := eng.LoadProxies(proxyFile); err != nil {
+			fmt.Printf("Warning: failed to load proxies: %v\n", err)
+		}
+	}
+
+	// Eagle Mode
+	if eagleScan != "" {
+		if err := eng.LoadPreviousScan(eagleScan); err != nil {
+			fmt.Printf("Warning: failed to load previous scan: %v\n", err)
+		} else {
+			fmt.Printf("[*] Eagle Mode: loaded %d endpoints from previous scan\n", len(eng.PreviousState))
+		}
+	}
+
+	// Auto-calibrate
+	if autoCalibrate {
+		fmt.Println("[*] Running auto-calibration...")
+		if err := eng.AutoCalibrate(); err != nil {
+			fmt.Printf("Warning: auto-calibration failed: %v\n", err)
+		}
+	}
+
+	// Determine output file
+	if outputFile == "" {
+		host := eng.Host()
+		host = strings.ReplaceAll(host, ":", "_")
+		dir := filepath.Join("scans", host)
+		os.MkdirAll(dir, 0755)
+		ext := "jsonl"
+		if outputFormat == "csv" {
+			ext = "csv"
+		} else if outputFormat == "url" {
+			ext = "txt"
+		}
+		outputFile = filepath.Join(dir, fmt.Sprintf("scan_%s.%s", time.Now().Format("2006-01-02_15-04-05"), ext))
+	}
+	eng.Config.Lock()
+	eng.Config.OutputFile = outputFile
+	eng.Config.Unlock()
+
+	// Start workers
+	eng.Start()
+
+	// Start wordlist scanner
+	eng.KickoffScanner(wordlist)
+
+	if noTUI {
+		runHeadless(eng, outputFile, outputFormat)
+	} else {
+		runWithTUI(eng, outputFile, outputFormat)
+	}
+}
+
+func runHeadless(eng *engine.Engine, outputFile, outputFormat string) {
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Printf("Error creating output file: %v\n", err)
+		return
+	}
+	defer outFile.Close()
+
+	var csvWriter *csv.Writer
+	if outputFormat == "csv" {
+		csvWriter = csv.NewWriter(outFile)
+		engine.WriteCSVHeader(csvWriter)
+		defer csvWriter.Flush()
+	}
+
 	go func() {
-		for res := range eng.Results {
-			if outputEncoder != nil {
-				outputEncoder.Encode(res)
+		eng.Wait()
+	}()
+
+	for result := range eng.Results {
+		if result.IsAutoFilter {
+			if msg, ok := result.Headers["Msg"]; ok {
+				fmt.Printf("[!] %s: %s\n", result.Path, msg)
 			}
-			if res.IsEagleAlert && eagleEncoder != nil {
-				eagleEncoder.Encode(res)
+			continue
+		}
+
+		fmt.Println(result.String())
+
+		switch outputFormat {
+		case "csv":
+			csvWriter.Write(result.ToCSV())
+		case "url":
+			if result.URL != "" {
+				fmt.Fprintln(outFile, result.URL)
 			}
-			if res.IsEagleAlert {
-				fmt.Printf("[EAGLE ALERT] %s (Old: %d -> New: %d)\n", res.Path, res.OldStatusCode, res.StatusCode)
+		default: // jsonl
+			data, _ := json.Marshal(result)
+			outFile.Write(append(data, '\n'))
+		}
+	}
+
+	fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
+}
+
+func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
+	outFile, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Printf("Error creating output file: %v\n", err)
+		return
+	}
+	defer outFile.Close()
+
+	var csvWriter *csv.Writer
+	if outputFormat == "csv" {
+		csvWriter = csv.NewWriter(outFile)
+		engine.WriteCSVHeader(csvWriter)
+		defer csvWriter.Flush()
+	}
+
+	// Writer goroutine: pull from a tapped channel
+	writeCh := make(chan engine.Result, 100)
+	go func() {
+		for result := range writeCh {
+			if result.IsAutoFilter {
+				continue
 			}
-			fmt.Println(res)
+			switch outputFormat {
+			case "csv":
+				csvWriter.Write(result.ToCSV())
+			case "url":
+				if result.URL != "" {
+					fmt.Fprintln(outFile, result.URL)
+				}
+			default:
+				data, _ := json.Marshal(result)
+				outFile.Write(append(data, '\n'))
+			}
+		}
+		if csvWriter != nil {
+			csvWriter.Flush()
 		}
 	}()
 
-	eng.Wait()
-	fmt.Printf("\n[+] Scan complete. Results saved to: %s\n", filename)
+	// Wrap engine Results channel to tap into the writer
+	origResults := eng.Results
+	tappedResults := make(chan engine.Result, cap(origResults))
+	eng.Results = tappedResults
+
+	go func() {
+		for r := range origResults {
+			writeCh <- r
+			tappedResults <- r
+		}
+		close(tappedResults)
+		close(writeCh)
+	}()
+
+	// Engine completion goroutine
+	go func() {
+		eng.Wait()
+	}()
+
+	// Start TUI
+	model := tui.NewModel(eng)
+	p := tea.NewProgram(model, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("TUI error: %v\n", err)
+	}
+
+	fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
 }

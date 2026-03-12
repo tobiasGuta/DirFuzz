@@ -3,10 +3,13 @@ package engine
 import (
 	"bufio"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,20 +31,34 @@ type Config struct {
 	FilterSizes map[int]bool
 	IsPaused    bool
 	Delay       time.Duration
-	MaxWorkers  int // Controls active workers
+	MaxWorkers  int
 	// Recursive settings
 	Recursive    bool
 	MaxDepth     int
-	WordlistPath string // Store original path for recursion
+	WordlistPath string
 	Extensions   []string
 	Mutate       bool
 	// Smart API Method Fuzzer
 	Methods    []string
 	SmartAPI   bool
 	OutputFile string
+	// Request body for POST/PUT fuzzing
+	RequestBody string
+	// Follow redirects
+	FollowRedirects bool
+	MaxRedirects    int
+	// Body matching/filtering
+	MatchRegex  string
+	FilterRegex string
+	FilterWords int // -1 means disabled
+	FilterLines int // -1 means disabled
+	MatchWords  int // -1 means disabled
+	MatchLines  int // -1 means disabled
+	// Output format
+	OutputFormat string // "jsonl", "csv", "url"
 }
 
-// Job represents a single scan task
+// Job represents a single scan task.
 type Job struct {
 	Path   string
 	Depth  int
@@ -93,9 +110,28 @@ type Engine struct {
 	Count500     int64
 	CountConnErr int64
 
+	// RPS calculation
+	lastProcessed int64
+	lastTick      time.Time
+	CurrentRPS    int64
+
 	// Smart Filter State
 	fpMutex  sync.RWMutex
-	fpCounts map[string]int // "Status:Size" -> count
+	fpCounts map[string]int
+
+	// Auto-throttle state
+	autoThrottle    bool
+	throttleRestore int
+
+	// HEAD rejection cache
+	headRejected int32 // atomic: 0=unknown 1=rejected
+
+	// Resume support
+	ResumeFile string
+
+	// Compiled regexes (cached)
+	matchRe  *regexp.Regexp
+	filterRe *regexp.Regexp
 }
 
 // Result holds the details of a successful fuzzing hit.
@@ -104,11 +140,16 @@ type Result struct {
 	Method        string            `json:"method,omitempty"`
 	StatusCode    int               `json:"status"`
 	Size          int               `json:"length"`
-	Redirect      string            `json:"redirect,omitempty"`    // Redirect location if applicable
-	Headers       map[string]string `json:"headers,omitempty"`     // Captured interesting headers
-	IsEagleAlert  bool              `json:"eagle_alert,omitempty"` // Flag for state changes
-	OldStatusCode int               `json:"old_status,omitempty"`  // Previous status code (if Eagle Alert)
-	IsAutoFilter  bool              `json:"auto_filter,omitempty"` // Flag for auto-filtering events
+	Words         int               `json:"words,omitempty"`
+	Lines         int               `json:"lines,omitempty"`
+	ContentType   string            `json:"content_type,omitempty"`
+	Duration      time.Duration     `json:"duration,omitempty"`
+	Redirect      string            `json:"redirect,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	IsEagleAlert  bool              `json:"eagle_alert,omitempty"`
+	OldStatusCode int               `json:"old_status,omitempty"`
+	IsAutoFilter  bool              `json:"auto_filter,omitempty"`
+	URL           string            `json:"url,omitempty"`
 }
 
 // String returns a string representation of the result for CLI output.
@@ -123,45 +164,75 @@ func (r Result) String() string {
 	if val, ok := r.Headers["X-Powered-By"]; ok {
 		extras += fmt.Sprintf(" [X-Powered-By: %s]", val)
 	}
+	if r.ContentType != "" {
+		extras += fmt.Sprintf(" [%s]", r.ContentType)
+	}
+	if r.Duration > 0 {
+		extras += fmt.Sprintf(" [%s]", r.Duration.Round(time.Millisecond))
+	}
 	methodStr := r.Method
 	if methodStr == "" {
 		methodStr = "HEAD/GET"
 	}
-	return fmt.Sprintf("[+] [%s] HIT: %s (Status: %d, Size: %d)%s", methodStr, r.Path, r.StatusCode, r.Size, extras)
+	return fmt.Sprintf("[+] [%s] HIT: %s (Status: %d, Size: %d, Words: %d, Lines: %d)%s",
+		methodStr, r.Path, r.StatusCode, r.Size, r.Words, r.Lines, extras)
+}
+
+// ToCSV returns a CSV-formatted line for the result.
+func (r Result) ToCSV() []string {
+	methodStr := r.Method
+	if methodStr == "" {
+		methodStr = "GET"
+	}
+	return []string{
+		methodStr,
+		r.URL,
+		r.Path,
+		strconv.Itoa(r.StatusCode),
+		strconv.Itoa(r.Size),
+		strconv.Itoa(r.Words),
+		strconv.Itoa(r.Lines),
+		r.ContentType,
+		r.Redirect,
+		r.Duration.Round(time.Millisecond).String(),
+	}
 }
 
 // NewEngine initializes a new Engine with a worker pool and a Bloom filter.
-// expectedItems: Estimated number of unique payloads (e.g., 10,000,000).
-// falsePositiveRate: Acceptable false positive rate (e.g., 0.001 for 0.1%).
 func NewEngine(numWorkers int, expectedItems uint, falsePositiveRate float64) *Engine {
-	// Initialize with a default rate limit (can be updated via SetRPS)
-	// Default to 50 RPS for safety
-	defaultRPS := rate.Limit(50)
-	burst := numWorkers // Allow burst equal to max concurrency
+	// Default to unlimited RPS — user controls via -delay flag
+	burst := numWorkers
 	if burst < 10 {
 		burst = 10
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		// Buffer the channel to prevent the producer from blocking immediately
 		jobs:       make(chan Job, numWorkers*10),
 		filter:     bloom.NewWithEstimates(expectedItems, falsePositiveRate),
 		numWorkers: numWorkers,
-		limiter:    rate.NewLimiter(defaultRPS, burst),
+		limiter:    rate.NewLimiter(rate.Inf, burst),
 		Config: &Config{
-			UserAgent:   "DirFuzz/1.0",
-			Headers:     make(map[string]string),
-			MatchCodes:  make(map[int]bool),
-			FilterSizes: make(map[int]bool),
-			IsPaused:    false,
-			Delay:       0,
-			MaxWorkers:  numWorkers,
+			UserAgent:    "DirFuzz/2.0",
+			Headers:      make(map[string]string),
+			MatchCodes:   make(map[int]bool),
+			FilterSizes:  make(map[int]bool),
+			IsPaused:     false,
+			Delay:        0,
+			MaxWorkers:   numWorkers,
+			MaxRedirects: 5,
+			FilterWords:  -1,
+			FilterLines:  -1,
+			MatchWords:   -1,
+			MatchLines:   -1,
+			OutputFormat: "jsonl",
 		},
 		scannerCtx:    ctx,
 		scannerCancel: cancel,
 		Results:       make(chan Result, numWorkers*10),
 		fpCounts:      make(map[string]int),
+		lastTick:      time.Now(),
+		autoThrottle:  true,
 	}
 }
 
@@ -194,7 +265,6 @@ func (e *Engine) GetNextProxy() string {
 	if len(e.proxies) == 0 {
 		return ""
 	}
-	// Use atomic increment for thread safety
 	idx := atomic.AddUint64(&e.proxyIndex, 1)
 	return e.proxies[(idx-1)%uint64(len(e.proxies))]
 }
@@ -215,9 +285,8 @@ func (e *Engine) LoadPreviousScan(path string) error {
 	for scanner.Scan() {
 		var res Result
 		if err := json.Unmarshal(scanner.Bytes(), &res); err != nil {
-			continue // Skip malformed lines
+			continue
 		}
-		// Populate the map with Path -> StatusCode
 		e.PreviousState[res.Path] = res.StatusCode
 	}
 	return scanner.Err()
@@ -226,9 +295,34 @@ func (e *Engine) LoadPreviousScan(path string) error {
 // SetRPS updates the rate limiter settings dynamically.
 func (e *Engine) SetRPS(rps int) {
 	if rps <= 0 {
-		e.limiter.SetLimit(rate.Inf) // No limit
+		e.limiter.SetLimit(rate.Inf)
 	} else {
 		e.limiter.SetLimit(rate.Limit(rps))
+	}
+}
+
+// UpdateRateLimiterFromDelay updates the rate limiter based on the delay setting.
+func (e *Engine) UpdateRateLimiterFromDelay() {
+	e.Config.RLock()
+	d := e.Config.Delay
+	workers := e.Config.MaxWorkers
+	e.Config.RUnlock()
+
+	if d <= 0 {
+		e.limiter.SetLimit(rate.Inf)
+		burst := workers
+		if burst < 10 {
+			burst = 10
+		}
+		e.limiter.SetBurst(burst)
+	} else {
+		// Each worker sleeps `d` per request, so effective RPS = workers / d_seconds
+		rps := float64(workers) / d.Seconds()
+		if rps < 1 {
+			rps = 1
+		}
+		e.limiter.SetLimit(rate.Limit(rps))
+		e.limiter.SetBurst(workers)
 	}
 }
 
@@ -244,6 +338,40 @@ func (e *Engine) ConfigureFilters(mc []int, fs []int) {
 	}
 }
 
+// SetMatchRegex compiles and caches the match regex.
+func (e *Engine) SetMatchRegex(pattern string) error {
+	if pattern == "" {
+		e.matchRe = nil
+		return nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+	e.matchRe = re
+	e.Config.Lock()
+	e.Config.MatchRegex = pattern
+	e.Config.Unlock()
+	return nil
+}
+
+// SetFilterRegex compiles and caches the filter regex.
+func (e *Engine) SetFilterRegex(pattern string) error {
+	if pattern == "" {
+		e.filterRe = nil
+		return nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return err
+	}
+	e.filterRe = re
+	e.Config.Lock()
+	e.Config.FilterRegex = pattern
+	e.Config.Unlock()
+	return nil
+}
+
 // UpdateUserAgent updates the User-Agent string safely.
 func (e *Engine) UpdateUserAgent(ua string) {
 	e.Config.Lock()
@@ -251,11 +379,12 @@ func (e *Engine) UpdateUserAgent(ua string) {
 	e.Config.UserAgent = ua
 }
 
-// SetDelay sets the delay between requests for each worker.
+// SetDelay sets the delay and updates the rate limiter accordingly.
 func (e *Engine) SetDelay(d time.Duration) {
 	e.Config.Lock()
-	defer e.Config.Unlock()
 	e.Config.Delay = d
+	e.Config.Unlock()
+	e.UpdateRateLimiterFromDelay()
 }
 
 // AddHeader adds or updates a custom header safely.
@@ -320,7 +449,6 @@ func (e *Engine) AddMatchCode(code int) {
 func (e *Engine) RemoveMatchCode(code int) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
-	// Usually we might want to ensure at least one code? But user can remove all if they want (nothing will match).
 	delete(e.Config.MatchCodes, code)
 }
 
@@ -328,7 +456,6 @@ func (e *Engine) RemoveMatchCode(code int) {
 func (e *Engine) AddExtension(ext string) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
-	// Avoid duplicates? Since slice iteration is fast enough for small lists...
 	for _, x := range e.Config.Extensions {
 		if x == ext {
 			return
@@ -364,6 +491,13 @@ func (e *Engine) SetPaused(paused bool) {
 	e.Config.IsPaused = paused
 }
 
+// SetFollowRedirects enables redirect following.
+func (e *Engine) SetFollowRedirects(follow bool) {
+	e.Config.Lock()
+	defer e.Config.Unlock()
+	e.Config.FollowRedirects = follow
+}
+
 // Restart restarts the scanner with the current wordlist and new configurations.
 func (e *Engine) Restart() error {
 	e.Config.RLock()
@@ -379,7 +513,6 @@ func (e *Engine) Restart() error {
 
 // ChangeWordlist cancels the current scanner and starts a new one with the given path.
 func (e *Engine) ChangeWordlist(path string) error {
-	// Verify that the new wordlist exists and is accessible before stopping the current one
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return fmt.Errorf("wordlist file does not exist: %s", path)
 	}
@@ -387,7 +520,7 @@ func (e *Engine) ChangeWordlist(path string) error {
 	// Stop existing scanner
 	e.scannerCancel()
 
-	// Reset Bloom filter so we can safely re-scan the same payloads
+	// Reset Bloom filter
 	e.filterLock.Lock()
 	e.filter = bloom.NewWithEstimates(10000000, 0.001)
 	e.filterLock.Unlock()
@@ -401,22 +534,22 @@ func (e *Engine) ChangeWordlist(path string) error {
 	atomic.StoreInt64(&e.Count429, 0)
 	atomic.StoreInt64(&e.Count500, 0)
 	atomic.StoreInt64(&e.CountConnErr, 0)
+	atomic.StoreInt64(&e.CurrentRPS, 0)
+	atomic.StoreInt32(&e.headRejected, 0)
 
 	// Reset auto-filter tracker
 	e.fpMutex.Lock()
 	e.fpCounts = make(map[string]int)
 	e.fpMutex.Unlock()
 
-	// Wait for the old scanner to finish/cleanup if necessary,
-	// but since we just want to start a new one, we can just re-initialize context.
-
-	// Drain any incredibly fast pending jobs from the old queue
-	// that didn't get cancelled fast enough
+	// Drain pending jobs safely — use a counter to limit drain attempts
 drainLoop:
-	for {
+	for i := 0; i < cap(e.jobs)*2; i++ {
 		select {
-		case <-e.jobs:
-			// Purge leftover job from channel queue
+		case _, ok := <-e.jobs:
+			if !ok {
+				break drainLoop
+			}
 			e.activeJobs.Done()
 		default:
 			break drainLoop
@@ -425,7 +558,6 @@ drainLoop:
 
 	// Create new context
 	e.scannerCtx, e.scannerCancel = context.WithCancel(context.Background())
-
 	atomic.AddInt64(&e.RunID, 1)
 
 	// Start new scanner
@@ -447,18 +579,16 @@ func (e *Engine) AddScanner() {
 // StartWordlistScanner reads from a Wordlist and submits payloads to the engine.
 func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path string) {
 	defer e.scannerWg.Done()
-	// Remember path for recursion
 	e.Config.Lock()
 	e.Config.WordlistPath = path
 	e.Config.Unlock()
 
 	file, err := os.Open(path)
 	if err != nil {
-		// Communicate the file error back without corrupting the TUI using fmt.Printf
 		e.Results <- Result{
 			Path:         path,
 			StatusCode:   0,
-			IsAutoFilter: true, // Reuse the auto filter styling as a system notification
+			IsAutoFilter: true,
 			Headers:      map[string]string{"Msg": "Error opening wordlist: " + err.Error()},
 		}
 		atomic.StoreInt64(&e.TotalLines, 0)
@@ -466,20 +596,18 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 	}
 	defer file.Close()
 
-	// Initial Scan to count total lines for progress bar
-	// This can take a moment for large files, but is necessary for accurate progress
+	// Count lines in single pass
 	atomic.StoreInt64(&e.ProcessedLines, 0)
 	lineCount := int64(0)
 
 	e.Config.RLock()
-	extMultiplier := int64(len(e.Config.Extensions) + 1) // +1 for the base word
+	extMultiplier := int64(len(e.Config.Extensions) + 1)
 	methods := e.Config.Methods
 	smartAPI := e.Config.SmartAPI
 	e.Config.RUnlock()
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		// Stop counting instantly if cancelled
 		select {
 		case <-ctx.Done():
 			return
@@ -491,24 +619,19 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 			continue
 		}
 
-		// Calculate method multiplier for this line
 		methodMultiplier := int64(1)
 		if len(methods) > 0 {
 			if !smartAPI {
 				methodMultiplier = int64(len(methods))
-			} else {
-				lowerLine := strings.ToLower(line)
-				if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
-					methodMultiplier = int64(len(methods))
-				}
+			} else if isAPIPath(line) {
+				methodMultiplier = int64(len(methods))
 			}
 		}
-
 		lineCount += methodMultiplier * extMultiplier
 	}
 	atomic.StoreInt64(&e.TotalLines, lineCount)
 
-	// Re-open file for actual processing (rewind doesn't work well on all OS/file types with scanner)
+	// Re-open file for processing
 	file.Close()
 	file, err = os.Open(path)
 	if err != nil {
@@ -516,14 +639,16 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 	}
 	defer file.Close()
 
+	// Save resume state periodically
+	lineNum := int64(0)
+
 	scanner = bufio.NewScanner(file)
 	for scanner.Scan() {
-		// Respect cancellation (e.g. from ChangeWordlist)
 		select {
 		case <-ctx.Done():
+			e.saveResumeState(path, lineNum)
 			return
 		default:
-			// Check for pause
 			e.Config.RLock()
 			paused := e.Config.IsPaused
 			e.Config.RUnlock()
@@ -533,9 +658,9 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 				paused = e.Config.IsPaused
 				e.Config.RUnlock()
 
-				// Also check cancellation while paused
 				select {
 				case <-ctx.Done():
+					e.saveResumeState(path, lineNum)
 					return
 				default:
 				}
@@ -543,36 +668,28 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 
 			line := scanner.Text()
 			if line != "" {
+				lineNum++
 				e.Config.RLock()
 				methods := e.Config.Methods
 				smartAPI := e.Config.SmartAPI
-				// Create copy to iterate safely
 				exts := make([]string, len(e.Config.Extensions))
 				copy(exts, e.Config.Extensions)
 				e.Config.RUnlock()
 
-				// Determine methods to use for this line
 				var methodsToUse []string
 				if len(methods) == 0 {
 					methodsToUse = []string{""}
 				} else if !smartAPI {
 					methodsToUse = methods
+				} else if isAPIPath(line) {
+					methodsToUse = methods
 				} else {
-					lowerLine := strings.ToLower(line)
-					if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
-						methodsToUse = methods
-					} else {
-						methodsToUse = []string{""}
-					}
+					methodsToUse = []string{""}
 				}
 
 				for _, method := range methodsToUse {
-					// 1. Send Base
 					e.Submit(Job{Path: line, Depth: 0, Method: method, RunID: runID})
-
-					// 2. Send Extensions
 					for _, ext := range exts {
-						// Handle if user provided dot or not
 						cleanExt := strings.TrimSpace(ext)
 						if !strings.HasPrefix(cleanExt, ".") {
 							cleanExt = "." + cleanExt
@@ -585,9 +702,50 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 	}
 }
 
+// isAPIPath checks if a path looks like an API endpoint.
+func isAPIPath(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "api") || strings.Contains(lower, "v1") ||
+		strings.Contains(lower, "v2") || strings.Contains(lower, "v3") ||
+		strings.Contains(lower, "rest") || strings.Contains(lower, "graphql")
+}
+
+// saveResumeState saves the current scan position for resume support.
+func (e *Engine) saveResumeState(wordlist string, lineNum int64) {
+	if e.ResumeFile == "" {
+		return
+	}
+	state := map[string]interface{}{
+		"wordlist":  wordlist,
+		"line":      lineNum,
+		"processed": atomic.LoadInt64(&e.ProcessedLines),
+		"total":     atomic.LoadInt64(&e.TotalLines),
+		"target":    e.BaseURL(),
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	os.WriteFile(e.ResumeFile, data, 0644)
+}
+
+// LoadResumeState loads resume state and returns the line to skip to.
+func (e *Engine) LoadResumeState(path string) (string, int64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0, err
+	}
+	var state map[string]interface{}
+	if err := json.Unmarshal(data, &state); err != nil {
+		return "", 0, err
+	}
+	wordlist, _ := state["wordlist"].(string)
+	lineF, _ := state["line"].(float64)
+	return wordlist, int64(lineF), nil
+}
+
 // SetTarget sets the target URL and extracts the host for raw requests.
 func (e *Engine) SetTarget(targetURL string) error {
-	// Support both upper and lower case payload markers
 	targetURL = strings.ReplaceAll(targetURL, "{payload}", "{PAYLOAD}")
 
 	u, err := url.Parse(targetURL)
@@ -615,6 +773,21 @@ func (e *Engine) Host() string {
 	return e.host
 }
 
+// UpdateRPS calculates the current requests per second.
+func (e *Engine) UpdateRPS() {
+	now := time.Now()
+	elapsed := now.Sub(e.lastTick).Seconds()
+	if elapsed < 0.1 {
+		return
+	}
+	current := atomic.LoadInt64(&e.ProcessedLines)
+	delta := current - e.lastProcessed
+	rps := int64(float64(delta) / elapsed)
+	atomic.StoreInt64(&e.CurrentRPS, rps)
+	e.lastProcessed = current
+	e.lastTick = now
+}
+
 // AutoCalibrate attempts to detect wildcard responses.
 func (e *Engine) AutoCalibrate() error {
 	const randLen = 16
@@ -629,19 +802,10 @@ func (e *Engine) AutoCalibrate() error {
 
 	for _, path := range randPaths {
 		rawRequest := []byte(fmt.Sprintf(
-			"GET %s HTTP/1.1\r\n"+
-				"Host: %s\r\n"+
-				"Connection: close\r\n"+
-				"User-Agent: %s\r\n"+
-				"Accept: */*\r\n"+
-				"\r\n",
-			path,
-			e.Host(),
-			e.Config.UserAgent,
+			"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\nAccept: */*\r\n\r\n",
+			path, e.Host(), e.Config.UserAgent,
 		))
 
-		// IMPORTANT: Ensure request to e.BaseURL() (full URL)
-		// Auto calibration uses direct connection or proxy if loaded
 		var proxyAddr string
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
@@ -663,29 +827,26 @@ func (e *Engine) AutoCalibrate() error {
 		}
 	}
 
-	if consistent {
+	if consistent && statusCode > 0 {
 		fmt.Printf("[+] Wildcard detected! Filtering Status: %d, Size: %d\n", statusCode, bodySize)
 		e.AddFilterSize(bodySize)
-		// Optionally filter status code too? The prompt specifically said "inject that Body Size".
 	}
 
 	return nil
 }
 
+// randomString generates a truly random string using math/rand/v2.
 func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzMJIKLOP0123456789"
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, n)
-	// Not cryptographically secure, but fine for fuzzing
 	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+		b[i] = letters[rand.IntN(len(letters))]
 	}
 	return string(b)
 }
 
 // checkRecursiveWildcard returns true if the directory responds to random paths with 200 OK.
-// It uses a random string to probe the directory.
 func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
-	// Respect the configured delay to avoid double-tapping the server instantly
 	e.Config.RLock()
 	delay := e.Config.Delay
 	e.Config.RUnlock()
@@ -693,52 +854,27 @@ func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
 		time.Sleep(delay)
 	}
 
-	// Construct a random path
 	randPath := dirPath
 	if !strings.HasSuffix(randPath, "/") {
 		randPath += "/"
 	}
 	randPath += randomString(12)
 
-	// Build raw request
 	rawRequest := []byte(fmt.Sprintf(
-		"GET %s HTTP/1.1\r\n"+
-			"Host: %s\r\n"+
-			"Connection: close\r\n"+
-			"User-Agent: %s\r\n"+
-			"Accept: */*\r\n"+
-			"\r\n",
-		randPath,
-		e.Host(),
-		e.Config.UserAgent,
+		"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\nAccept: */*\r\n\r\n",
+		randPath, e.Host(), e.Config.UserAgent,
 	))
 
-	// Send probe
-	// Use shorter timeout for check
 	var proxyAddr string
 	if e.proxyDialer {
 		proxyAddr = e.GetNextProxy()
 	}
 	resp, err := httpclient.SendRawRequest(e.BaseURL(), rawRequest, 3*time.Second, proxyAddr)
 	if err != nil {
-		// If probe fails (timeout/connRefused), assume safe to proceed?
-		// Or assume unstable. Let's assume safe, since wildcard usually means active server.
 		return false
 	}
 
-	// 200 OK on random path -> Wildcard (Soft 404)
-	// 403 Forbidden on random path -> Likely protected directory or WAF blocking
-	// If a random file returns 403, scanning thousands of files will likely all be 403.
-	// We should skip recursion in this case too to avoid spam.
-	if resp.StatusCode == 200 || resp.StatusCode == 403 {
-		// Log debug if needed, or just return true to skip
-		// Also, if it's a 200 OK wildcard, maybe we SHOULD add it to filters if requested?
-		// But doing so would kill valid pages of that size globally.
-		// The user request suggests they want to see "auto calibration" actions in the config view.
-		// If this function acts as a per-directory auto-calibration, it's invisible.
-		return true
-	}
-	return false
+	return resp.StatusCode == 200 || resp.StatusCode == 403
 }
 
 // QueueSize returns the current number of jobs in the queue.
@@ -777,51 +913,151 @@ func (e *Engine) SetWorkerCount(n int) {
 			go e.worker(e.numWorkers + i)
 		}
 	}
-	// Always update the tracking count
 	e.numWorkers = n
+	e.UpdateRateLimiterFromDelay()
+}
+
+// autoThrottleCheck handles automatic throttling when 429 responses spike.
+func (e *Engine) autoThrottleCheck() {
+	if !e.autoThrottle {
+		return
+	}
+	count429 := atomic.LoadInt64(&e.Count429)
+	if count429 > 0 && count429%10 == 0 {
+		e.Config.RLock()
+		currentWorkers := e.Config.MaxWorkers
+		currentDelay := e.Config.Delay
+		e.Config.RUnlock()
+
+		// Save original worker count for restoration
+		if e.throttleRestore == 0 {
+			e.throttleRestore = currentWorkers
+		}
+
+		// Reduce workers by 50%, minimum 5
+		newWorkers := currentWorkers / 2
+		if newWorkers < 5 {
+			newWorkers = 5
+		}
+
+		// Increase delay
+		newDelay := currentDelay + 200*time.Millisecond
+		if newDelay > 5*time.Second {
+			newDelay = 5 * time.Second
+		}
+
+		e.SetWorkerCount(newWorkers)
+		e.SetDelay(newDelay)
+
+		e.Results <- Result{
+			Path:         "AUTO-THROTTLE",
+			StatusCode:   429,
+			IsAutoFilter: true,
+			Headers:      map[string]string{"Msg": fmt.Sprintf("429 detected! Workers: %d->%d, Delay: %s", currentWorkers, newWorkers, newDelay)},
+		}
+	}
+}
+
+// followRedirectChain follows HTTP redirects and returns the final response.
+func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, targetURL, reqHost, ua string, headers map[string]string, maxRedirects int, proxyAddr string) (*httpclient.RawResponse, string) {
+	resp := initialResp
+	finalURL := ""
+
+	for i := 0; i < maxRedirects; i++ {
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			break
+		}
+		location := resp.GetHeader("Location")
+		if location == "" {
+			break
+		}
+
+		// Resolve relative URLs
+		if strings.HasPrefix(location, "/") {
+			parsed, _ := url.Parse(targetURL)
+			if parsed != nil {
+				location = parsed.Scheme + "://" + parsed.Host + location
+			}
+		} else if !strings.HasPrefix(location, "http") {
+			parsed, _ := url.Parse(targetURL)
+			if parsed != nil {
+				location = parsed.Scheme + "://" + parsed.Host + "/" + location
+			}
+		}
+
+		parsedLoc, err := url.Parse(location)
+		if err != nil {
+			break
+		}
+
+		reqPath := parsedLoc.Path
+		if parsedLoc.RawQuery != "" {
+			reqPath += "?" + parsedLoc.RawQuery
+		}
+		if reqPath == "" {
+			reqPath = "/"
+		}
+
+		var headersStr strings.Builder
+		for k, v := range headers {
+			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+		}
+
+		rawReq := []byte(fmt.Sprintf(
+			"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
+			reqPath, parsedLoc.Host, ua, headersStr.String(),
+		))
+
+		nextResp, err := httpclient.SendRawRequest(location, rawReq, 5*time.Second, proxyAddr)
+		if err != nil {
+			break
+		}
+		resp = nextResp
+		finalURL = location
+	}
+
+	return resp, finalURL
 }
 
 // worker is the concurrent consumer that pulls from the jobs channel.
 func (e *Engine) worker(id int) {
-	// Ensure Done is called when the goroutine exits
 	defer e.wg.Done()
 
 	for job := range e.jobs {
-		// Drop immediately if job belongs to a generation that was cancelled.
-		// Ensures old jobs never process or increment counters for a new scan.
 		if job.RunID != atomic.LoadInt64(&e.RunID) {
 			e.activeJobs.Done()
 			continue
 		}
 
-		var doRecurse bool
-		var maxDepth int
-		var wordlistPath string
-		var result Result
-		var capturedHeaders map[string]string
-		var headerLines []string
-		var bodySize int
-		var clVal string
-		var successfulMethod string
-		var proxyAddr string
-		var target string
-		var resp *httpclient.RawResponse
-		var rawRequest []byte
-		var headersStr strings.Builder
-		var reqHost string
-		var reqPath string
 		payload := job.Path
 		depth := job.Depth
 
-		// Thread-safe config read
+		// Snapshot config once per job (performance: reduce lock contention)
 		e.Config.RLock()
 		maxWorkers := e.Config.MaxWorkers
 		paused := e.Config.IsPaused
+		ua := e.Config.UserAgent
+		headers := make(map[string]string)
+		for k, v := range e.Config.Headers {
+			headers[k] = v
+		}
+		matchCodes := make(map[int]bool)
+		for k, v := range e.Config.MatchCodes {
+			matchCodes[k] = v
+		}
+		filterSizes := make(map[int]bool)
+		for k, v := range e.Config.FilterSizes {
+			filterSizes[k] = v
+		}
+		followRedirects := e.Config.FollowRedirects
+		maxRedirects := e.Config.MaxRedirects
+		requestBody := e.Config.RequestBody
+		filterWords := e.Config.FilterWords
+		filterLines := e.Config.FilterLines
+		matchWords := e.Config.MatchWords
+		matchLines := e.Config.MatchLines
 		e.Config.RUnlock()
 
-		// Check if this worker ID is still valid within current pool size.
-		// CRITICAL FIX: If we are scaling down, we must still process this payload
-		// because we already took it from the channel. We will exit AFTER processing.
 		shouldExit := id >= maxWorkers
 
 		// Pause loop
@@ -832,31 +1068,13 @@ func (e *Engine) worker(id int) {
 			e.Config.RUnlock()
 		}
 
-		e.Config.RLock()
-		ua := e.Config.UserAgent
-		// delay is handled by limiter now
-		// Create a copy of headers to avoid race conditions during iteration/map access in request construction
-		headers := make(map[string]string)
-		for k, v := range e.Config.Headers {
-			headers[k] = v
-		}
-		// Copy matchCodes and filterSizes for safe read
-		matchCodes := make(map[int]bool)
-		for k, v := range e.Config.MatchCodes {
-			matchCodes[k] = v
-		}
-		filterSizes := make(map[int]bool)
-		for k, v := range e.Config.FilterSizes {
-			filterSizes[k] = v
-		}
-		e.Config.RUnlock()
-
-		// Global Rate Limiter Wait
-		// This replaces the per-worker sleep and ensures perfect global RPS
-		err := e.limiter.Wait(context.Background())
-		if err != nil {
-			// Context canceled?
-			break
+		// Rate limiter wait
+		if err := e.limiter.Wait(context.Background()); err != nil {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
 		}
 
 		// Construct the full URL
@@ -870,7 +1088,6 @@ func (e *Engine) worker(id int) {
 		if strings.Contains(currentBaseURL, "{PAYLOAD}") {
 			fullURL = strings.Replace(currentBaseURL, "{PAYLOAD}", word, 1)
 		} else {
-			// Ensure word starts with /
 			if !strings.HasPrefix(word, "/") {
 				word = "/" + word
 			}
@@ -879,140 +1096,134 @@ func (e *Engine) worker(id int) {
 
 		parsedURL, errURL := url.Parse(fullURL)
 		if errURL != nil {
-			goto nextJob
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
 		}
 
-		reqPath = parsedURL.Path
+		reqPath := parsedURL.Path
 		if parsedURL.RawQuery != "" {
 			reqPath += "?" + parsedURL.RawQuery
 		}
 		if reqPath == "" {
 			reqPath = "/"
 		}
-		reqHost = parsedURL.Host
+		reqHost := parsedURL.Host
 
 		// Build headers string
-		headersStr.Reset()
+		var headersStr strings.Builder
 		for k, v := range headers {
 			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 
-		target = currentBaseURL
+		var proxyAddr string
 		if e.proxyDialer {
 			proxyAddr = e.GetNextProxy()
 		}
 
+		var resp *httpclient.RawResponse
+		var err error
+		var successfulMethod string
+
 		if job.Method == "" {
-			successfulMethod = "HEAD"
-			// Using HEAD by default as requested to avoid full body downloads
-			// Re-enabling Keep-Alive to avoid socket churning
-			rawRequest = []byte(fmt.Sprintf(
-				"HEAD %s HTTP/1.1\r\n"+
-					"Host: %s\r\n"+
-					"Connection: keep-alive\r\n"+
-					"User-Agent: %s\r\n"+
-					"%s"+
-					"Accept: */*\r\n"+
-					"\r\n",
-				reqPath,
-				reqHost,
-				ua,
-				headersStr.String(),
-			))
-
-			resp, err = httpclient.SendRawRequest(target, rawRequest, 5*time.Second, proxyAddr)
-			atomic.AddInt64(&e.ProcessedLines, 1)
-
-			if err != nil {
-				// e.g. timeouts, connection refused
-				atomic.AddInt64(&e.CountConnErr, 1)
-				goto nextJob
-			}
-
-			// Fallback: If HEAD fails (405 Method Not Allowed / 501 Not Implemented), retry with GET
-			if resp.StatusCode == 405 || resp.StatusCode == 501 {
+			// Check HEAD rejection cache
+			if atomic.LoadInt32(&e.headRejected) == 1 {
+				// Skip HEAD, go straight to GET
 				successfulMethod = "GET"
-				// Construct a minimal GET request
-				// We MUST force Connection: close and try to read only minimal data to be safe.
 				rawGET := []byte(fmt.Sprintf(
-					"GET %s HTTP/1.1\r\n"+
-						"Host: %s\r\n"+
-						"Connection: close\r\n"+
-						"User-Agent: %s\r\n"+
-						"%s"+ // Headers
-						"Accept: */*\r\n"+
-						"\r\n",
-					reqPath,
-					reqHost,
-					ua,
-					headersStr.String(),
+					"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
+					reqPath, reqHost, ua, headersStr.String(),
 				))
+				resp, err = httpclient.SendRawRequest(currentBaseURL, rawGET, 5*time.Second, proxyAddr)
+			} else {
+				successfulMethod = "HEAD"
+				rawRequest := []byte(fmt.Sprintf(
+					"HEAD %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
+					reqPath, reqHost, ua, headersStr.String(),
+				))
+				resp, err = httpclient.SendRawRequest(currentBaseURL, rawRequest, 5*time.Second, proxyAddr)
 
-				respFallback, errFallback := httpclient.SendRawRequest(target, rawGET, 5*time.Second, proxyAddr)
-				if errFallback == nil {
-					// Use the fallback response instead
-					resp = respFallback
-				} else {
-					// If GET fails, revert to HEAD method for logging
-					successfulMethod = "HEAD"
+				if err == nil && (resp.StatusCode == 405 || resp.StatusCode == 501) {
+					// Cache: this host rejects HEAD
+					atomic.StoreInt32(&e.headRejected, 1)
+					successfulMethod = "GET"
+					rawGET := []byte(fmt.Sprintf(
+						"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
+						reqPath, reqHost, ua, headersStr.String(),
+					))
+					respFB, errFB := httpclient.SendRawRequest(currentBaseURL, rawGET, 5*time.Second, proxyAddr)
+					if errFB == nil {
+						resp = respFB
+					} else {
+						successfulMethod = "HEAD"
+					}
 				}
 			}
+			atomic.AddInt64(&e.ProcessedLines, 1)
 		} else {
 			successfulMethod = job.Method
-			// Smart API Method Fuzzer logic
-			// Inject Content-Length: 0 for methods that might hang reverse proxies
-			if job.Method == "POST" || job.Method == "PUT" || job.Method == "PATCH" || job.Method == "DELETE" {
+			bodyContent := ""
+			if requestBody != "" && (job.Method == "POST" || job.Method == "PUT" || job.Method == "PATCH") {
+				bodyContent = strings.ReplaceAll(requestBody, "{PAYLOAD}", payload)
+				headersStr.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(bodyContent)))
+			} else if job.Method == "POST" || job.Method == "PUT" || job.Method == "PATCH" || job.Method == "DELETE" {
 				headersStr.WriteString("Content-Length: 0\r\n")
 			}
 
-			rawRequest = []byte(fmt.Sprintf(
-				"%s %s HTTP/1.1\r\n"+
-					"Host: %s\r\n"+
-					"Connection: close\r\n"+
-					"User-Agent: %s\r\n"+
-					"%s"+
-					"Accept: */*\r\n"+
-					"\r\n",
-				job.Method,
-				reqPath,
-				reqHost,
-				ua,
-				headersStr.String(),
+			rawRequest := []byte(fmt.Sprintf(
+				"%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n%s",
+				job.Method, reqPath, reqHost, ua, headersStr.String(), bodyContent,
 			))
 
-			resp, err = httpclient.SendRawRequest(target, rawRequest, 5*time.Second, proxyAddr)
+			resp, err = httpclient.SendRawRequest(currentBaseURL, rawRequest, 5*time.Second, proxyAddr)
 			atomic.AddInt64(&e.ProcessedLines, 1)
-
-			if err != nil {
-				atomic.AddInt64(&e.CountConnErr, 1)
-				goto nextJob
-			}
 		}
 
-		// Update Stats Counters
-		if resp.StatusCode == 200 {
+		if err != nil {
+			atomic.AddInt64(&e.CountConnErr, 1)
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+
+		// Update stats counters
+		switch {
+		case resp.StatusCode == 200:
 			atomic.AddInt64(&e.Count200, 1)
-		} else if resp.StatusCode == 403 {
+		case resp.StatusCode == 403:
 			atomic.AddInt64(&e.Count403, 1)
-		} else if resp.StatusCode == 404 {
+		case resp.StatusCode == 404:
 			atomic.AddInt64(&e.Count404, 1)
-		} else if resp.StatusCode == 429 {
+		case resp.StatusCode == 429:
 			atomic.AddInt64(&e.Count429, 1)
-		} else if resp.StatusCode >= 500 {
+			e.autoThrottleCheck()
+		case resp.StatusCode >= 500:
 			atomic.AddInt64(&e.Count500, 1)
+		}
+
+		// Follow redirects if enabled
+		var finalRedirectURL string
+		if followRedirects && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			resp, finalRedirectURL = e.followRedirectChain(resp, fullURL, reqHost, ua, headers, maxRedirects, proxyAddr)
 		}
 
 		// Filtering Logic
 		// 1. Check Status Code
 		if len(matchCodes) > 0 && !matchCodes[resp.StatusCode] {
-			goto nextJob
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
 		}
 
-		// 2. Check Body Size
-		// Prefer Content-Length header if available, otherwise fallback to read body size.
-		// This handles the new optimization where we don't download the full body.
-		bodySize = len(resp.Body)
-		clVal = resp.GetHeader("Content-Length")
+		// 2. Body Size
+		bodySize := len(resp.Body)
+		clVal := resp.GetHeader("Content-Length")
 		if clVal != "" {
 			if s, err := strconv.Atoi(clVal); err == nil {
 				bodySize = s
@@ -1020,12 +1231,67 @@ func (e *Engine) worker(id int) {
 		}
 
 		if len(filterSizes) > 0 && filterSizes[bodySize] {
-			goto nextJob
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
 		}
 
-		// Smart Filter Logic: Check for repetitive results (likely false positives)
-		// Only track 200, 301, 302, 403 (common noise sources)
-		// Also ensure we don't track empty body size errors if they are common (usually 0 is filterd anyway if empty)
+		// 3. Word/Line count
+		bodyStr := string(resp.Body)
+		wordCount := len(strings.Fields(bodyStr))
+		lineCount := strings.Count(bodyStr, "\n") + 1
+		if len(bodyStr) == 0 {
+			lineCount = 0
+		}
+
+		if filterWords >= 0 && wordCount == filterWords {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+		if filterLines >= 0 && lineCount == filterLines {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+		if matchWords >= 0 && wordCount != matchWords {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+		if matchLines >= 0 && lineCount != matchLines {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+
+		// 4. Body regex matching
+		if e.matchRe != nil && !e.matchRe.Match(resp.Body) {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+		if e.filterRe != nil && e.filterRe.Match(resp.Body) {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+
+		// Smart Filter Logic
 		if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 403 {
 			fpKey := fmt.Sprintf("%d:%d", resp.StatusCode, bodySize)
 
@@ -1034,39 +1300,29 @@ func (e *Engine) worker(id int) {
 			count := e.fpCounts[fpKey]
 			e.fpMutex.Unlock()
 
-			// If we see the same status/size 15 times, consider blocking it
 			if count == 15 {
-				// We inject it into the filter immediately
 				e.AddFilterSize(bodySize)
-
-				// Notify via special result
-				alert := Result{
+				e.Results <- Result{
 					Path:         "AUTO-FILTER",
 					Method:       successfulMethod,
-					StatusCode:   resp.StatusCode, // Reuse status for display
+					StatusCode:   resp.StatusCode,
 					Size:         bodySize,
 					Headers:      map[string]string{"Msg": fmt.Sprintf("Auto-filtered repetitive size: %d", bodySize)},
-					IsEagleAlert: false, // Don't use Eagle styling
-					IsAutoFilter: true,  // Use new Auto Filter styling
+					IsAutoFilter: true,
 				}
-				// Non-blocking send or blocked? worker is single threaded here.
-				// Assuming channel has capacity.
-				e.Results <- alert
 			}
-
-			// If we already detected enough of these, drop this one.
 			if count >= 15 {
-				goto nextJob
+				e.activeJobs.Done()
+				if shouldExit {
+					return
+				}
+				continue
 			}
 		}
 
-		// Output result
-		// Capture interesting headers for fingerprinting
-		capturedHeaders = make(map[string]string)
-
-		// Parse headers from the raw headers string
-		// Improve parsing to handle \n or \r\n
-		headerLines = strings.Split(strings.ReplaceAll(resp.Headers, "\r\n", "\n"), "\n")
+		// Capture interesting headers
+		capturedHeaders := make(map[string]string)
+		headerLines := strings.Split(strings.ReplaceAll(resp.Headers, "\r\n", "\n"), "\n")
 		for _, line := range headerLines {
 			if idx := strings.Index(line, ":"); idx != -1 {
 				key := strings.TrimSpace(line[:idx])
@@ -1081,16 +1337,30 @@ func (e *Engine) worker(id int) {
 			}
 		}
 
-		result = Result{
-			Path:       payload,
-			Method:     successfulMethod,
-			StatusCode: resp.StatusCode,
-			Size:       bodySize,
-			Headers:    capturedHeaders,
+		contentType := resp.GetHeader("Content-Type")
+		// Simplify content type for display
+		if idx := strings.Index(contentType, ";"); idx != -1 {
+			contentType = strings.TrimSpace(contentType[:idx])
 		}
 
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		result := Result{
+			Path:        payload,
+			Method:      successfulMethod,
+			StatusCode:  resp.StatusCode,
+			Size:        bodySize,
+			Words:       wordCount,
+			Lines:       lineCount,
+			ContentType: contentType,
+			Duration:    resp.Duration,
+			Headers:     capturedHeaders,
+			URL:         fullURL,
+		}
+
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 && !followRedirects {
 			result.Redirect = resp.GetHeader("Location")
+		}
+		if finalRedirectURL != "" {
+			result.Redirect = finalRedirectURL
 		}
 
 		// Eagle Mode Check
@@ -1105,109 +1375,79 @@ func (e *Engine) worker(id int) {
 
 		e.Results <- result
 
-		// Smart Mutation (-mutate)
-		// Check for hits that look like files
+		// Smart Mutation
 		if resp.StatusCode == 200 || resp.StatusCode == 403 || resp.StatusCode == 301 {
 			e.Config.RLock()
 			doMutate := e.Config.Mutate
 			e.Config.RUnlock()
 
-			if doMutate {
-				// Only mutate files (heuristic: has extension)
-				// Requirement: "if the discovered path contains a file extension (using filepath.Ext(path) or checking for a .)"
-				if strings.Contains(payload, ".") {
-					// Launch in goroutine to avoid blocking the worker on channel send
-					go func(runID int64, basePath string, method string) {
-						// Required mutations: path + ".bak", path + ".old", path + ".save", path + "~", and path + ".swp"
-						mutations := []string{".bak", ".old", ".save", "~", ".swp"}
-						for _, m := range mutations {
-							e.Submit(Job{Path: basePath + m, Depth: depth, Method: method, RunID: runID})
-						}
-					}(job.RunID, payload, job.Method)
-				}
+			if doMutate && strings.Contains(payload, ".") {
+				go func(runID int64, basePath string, method string) {
+					mutations := []string{".bak", ".old", ".save", "~", ".swp"}
+					for _, m := range mutations {
+						e.Submit(Job{Path: basePath + m, Depth: depth, Method: method, RunID: runID})
+					}
+				}(job.RunID, payload, job.Method)
 			}
 		}
 
 		// Recursive Logic
 		e.Config.RLock()
-		doRecurse = e.Config.Recursive
-		maxDepth = e.Config.MaxDepth
-		wordlistPath = e.Config.WordlistPath
+		doRecurse := e.Config.Recursive
+		maxDepth := e.Config.MaxDepth
+		wordlistPath := e.Config.WordlistPath
 		e.Config.RUnlock()
 
 		if doRecurse && depth < maxDepth {
-			// We found a directory! (Assuming 2xx/3xx implies a accessible path)
-			// But wait, 301 is a redirect, 200 is a file or dir listing.
-			// Ideally we only recurse on directories.
-			// For fuzzing, usually we treat any HIT as a potential directory if it doesn't have an extension?
-			// Or just blindly recurse. Given the instruction "if recursive == true ... safely spawn ... to read wordlist again"
-
-			// Perform wildcard verification synchronously within the worker
-			// This ensures we rate-limit the checks and don't spawn thousands of goroutines that slam the server.
-			if e.checkRecursiveWildcard(payload) {
-				// It's a wildcard, skip recursion
-				goto nextJob
-			}
-
-			// We spawn a goroutine to read the wordlist and queue jobs
-			// This part is CPU/Disk bound, not Network bound, so it's fine to be async to keep the worker free.
-			e.AddScanner()
-			go func(runID int64, basePath string, nextDepth int, wlPath string) {
-				defer e.scannerWg.Done()
-				f, err := os.Open(wlPath)
-				if err != nil {
-					return
-				}
-				defer f.Close()
-
-				e.Config.RLock()
-				methods := e.Config.Methods
-				smartAPI := e.Config.SmartAPI
-				e.Config.RUnlock()
-
-				// Scanner logic...
-				scanner := bufio.NewScanner(f)
-				for scanner.Scan() {
-					word := scanner.Text()
-					if word == "" {
-						continue
+			if !e.checkRecursiveWildcard(payload) {
+				e.AddScanner()
+				go func(runID int64, basePath string, nextDepth int, wlPath string) {
+					defer e.scannerWg.Done()
+					f, err := os.Open(wlPath)
+					if err != nil {
+						return
 					}
+					defer f.Close()
 
-					// Construct new path: basePath + "/" + word
-					// Ensure slashes
-					newPath := basePath
-					if !strings.HasSuffix(newPath, "/") {
-						newPath += "/"
-					}
-					newPath += strings.TrimPrefix(word, "/")
+					e.Config.RLock()
+					methods := e.Config.Methods
+					smartAPI := e.Config.SmartAPI
+					e.Config.RUnlock()
 
-					// Determine methods to use for this line
-					var methodsToUse []string
-					if len(methods) == 0 {
-						methodsToUse = []string{""}
-					} else if !smartAPI {
-						methodsToUse = methods
-					} else {
-						lowerLine := strings.ToLower(newPath)
-						if strings.Contains(lowerLine, "api") || strings.Contains(lowerLine, "v1") || strings.Contains(lowerLine, "v2") || strings.Contains(lowerLine, "v3") || strings.Contains(lowerLine, "rest") || strings.Contains(lowerLine, "graphql") {
+					scanner := bufio.NewScanner(f)
+					for scanner.Scan() {
+						word := scanner.Text()
+						if word == "" {
+							continue
+						}
+
+						newPath := basePath
+						if !strings.HasSuffix(newPath, "/") {
+							newPath += "/"
+						}
+						newPath += strings.TrimPrefix(word, "/")
+
+						var methodsToUse []string
+						if len(methods) == 0 {
+							methodsToUse = []string{""}
+						} else if !smartAPI {
+							methodsToUse = methods
+						} else if isAPIPath(newPath) {
 							methodsToUse = methods
 						} else {
 							methodsToUse = []string{""}
 						}
-					}
 
-					for _, method := range methodsToUse {
-						// Update TotalLines because recursive jobs extend the scan
-						atomic.AddInt64(&e.TotalLines, 1)
-						e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method, RunID: runID})
+						for _, method := range methodsToUse {
+							atomic.AddInt64(&e.TotalLines, 1)
+							e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method, RunID: runID})
+						}
 					}
-				}
-			}(job.RunID, payload, depth+1, wordlistPath)
+				}(job.RunID, payload, depth+1, wordlistPath)
+			}
 		}
 
-	nextJob:
 		e.activeJobs.Done()
-
 		if shouldExit {
 			return
 		}
@@ -1216,13 +1456,10 @@ func (e *Engine) worker(id int) {
 
 // Submit adds a payload to the queue if it passes the Bloom filter check.
 func (e *Engine) Submit(job Job) {
-	// Drop job immediately if it belongs to a cancelled scan generation
 	if job.RunID != atomic.LoadInt64(&e.RunID) {
 		return
 	}
 
-	// The Bloom filter is not thread-safe for concurrent writes by default.
-	// We lock it to ensure safe concurrent submissions if there are multiple producers.
 	e.filterLock.Lock()
 	filterKey := job.Path
 	if job.Method != "" {
@@ -1232,14 +1469,11 @@ func (e *Engine) Submit(job Job) {
 	e.filterLock.Unlock()
 
 	if isDuplicate {
-		// Drop the payload instantly
-		// Count as processed since we won't process it
 		atomic.AddInt64(&e.ProcessedLines, 1)
 		return
 	}
 
 	e.activeJobs.Add(1)
-	// Send to the worker queue
 	e.jobs <- job
 }
 
@@ -1250,6 +1484,11 @@ func (e *Engine) Wait() {
 	close(e.jobs)
 	e.wg.Wait()
 	close(e.Results)
+}
+
+// WriteResultCSV writes a CSV header to the given writer.
+func WriteCSVHeader(w *csv.Writer) {
+	w.Write([]string{"Method", "URL", "Path", "Status", "Size", "Words", "Lines", "ContentType", "Redirect", "Duration"})
 }
 
 type EngineConfigDump struct {

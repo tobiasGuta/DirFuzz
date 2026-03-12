@@ -1,16 +1,12 @@
 package tui
 
 import (
+	"dirfuzz/pkg/engine"
 	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"dirfuzz/pkg/engine"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -18,1070 +14,764 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Styles for the TUI
+// TUI Colors (Dracula Theme)
 var (
-	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#BD93F9"))                                           // Dracula Purple
-	boxStyle       = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#6272A4")).Padding(0, 1) // Dracula Comment/Selection
-	activeBoxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#50FA7B")).Padding(0, 1) // Green Border for Focus
-
-	// Dracula Palette
-	draculaBg       = lipgloss.Color("#282A36")
-	draculaCurrLine = lipgloss.Color("#44475A")
-	draculaFg       = lipgloss.Color("#F8F8F2")
-	draculaComment  = lipgloss.Color("#6272A4")
-	draculaCyan     = lipgloss.Color("#8BE9FD")
-	draculaGreen    = lipgloss.Color("#50FA7B")
-	draculaOrange   = lipgloss.Color("#FFB86C")
-	draculaPink     = lipgloss.Color("#FF79C6")
-	draculaPurple   = lipgloss.Color("#BD93F9")
-	draculaRed      = lipgloss.Color("#FF5555")
-	draculaYellow   = lipgloss.Color("#F1FA8C")
-
-	okStyle    = lipgloss.NewStyle().Foreground(draculaGreen)
-	errStyle   = lipgloss.NewStyle().Foreground(draculaRed)
-	warnStyle  = lipgloss.NewStyle().Foreground(draculaOrange)
-	infoStyle  = lipgloss.NewStyle().Foreground(draculaCyan)
-	pauseStyle = lipgloss.NewStyle().Bold(true).Foreground(draculaPink).Blink(true)
-	cmdStyle   = lipgloss.NewStyle().Foreground(draculaFg).Background(draculaCurrLine)
-
-	// Log Styles
-	pathStyle = lipgloss.NewStyle().Foreground(draculaCyan).Bold(true)
-	status200 = lipgloss.NewStyle().Foreground(draculaGreen)
-	status300 = lipgloss.NewStyle().Foreground(draculaPurple)
-	status400 = lipgloss.NewStyle().Foreground(draculaOrange)
-	status500 = lipgloss.NewStyle().Foreground(draculaRed)
-	sizeStyle = lipgloss.NewStyle().Foreground(draculaYellow)
+	DraculaBg      = lipgloss.Color("#282a36")
+	DraculaFg      = lipgloss.Color("#f8f8f2")
+	DraculaPurple  = lipgloss.Color("#bd93f9")
+	DraculaGreen   = lipgloss.Color("#50fa7b")
+	DraculaCyan    = lipgloss.Color("#8be9fd")
+	DraculaOrange  = lipgloss.Color("#ffb86c")
+	DraculaRed     = lipgloss.Color("#ff5555")
+	DraculaPink    = lipgloss.Color("#ff79c6")
+	DraculaYellow  = lipgloss.Color("#f1fa8c")
+	DraculaComment = lipgloss.Color("#6272a4")
 )
 
-// Messages for updating the TUI from the engine
-type TickMsg time.Time
-type LogMsg engine.Result
-type StatusMsg string // For validation errors etc
-type StatsMsg struct {
-	RPS       int
-	QueueSize int
-	Err403    int
-	Err429    int
-	Err500    int
+// Styles
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(DraculaPurple).
+			Background(DraculaBg).
+			PaddingLeft(1).
+			PaddingRight(1)
 
-	// Progress
-	ProgressCurrent int64
-	ProgressTotal   int64
-}
+	statusStyle = lipgloss.NewStyle().
+			Foreground(DraculaGreen)
 
-// Model holds the state of the TUI
-type Model struct {
-	// Telemetry
-	RPS       int
-	QueueSize int
-	Err403    int
-	Err429    int
-	Err500    int
-	ErrConn   int
-	StatusStr string
+	errorStyle = lipgloss.NewStyle().
+			Foreground(DraculaRed)
 
-	// Progress
-	ProgressTotal   int64
-	ProgressCurrent int64
+	mutedStyle = lipgloss.NewStyle().
+			Foreground(DraculaComment)
 
-	// State
-	Paused    bool
-	PrePaused bool // Tracks if user had manually paused before command mode
-	Workers   int
-	Engine    *engine.Engine
+	highlightStyle = lipgloss.NewStyle().
+			Foreground(DraculaCyan)
 
-	// Command Mode
-	CommandMode     bool
-	TextInput       textinput.Model
-	Suggestions     []CommandDef
-	SuggestionIndex int
+	orangeStyle = lipgloss.NewStyle().
+			Foreground(DraculaOrange)
 
-	// Viewport for Top Panel
-	Viewport     viewport.Model
-	HelpViewport viewport.Model
-	TopFocused   bool
+	pinkStyle = lipgloss.NewStyle().
+			Foreground(DraculaPink)
 
-	// Logs
-	Logs         []engine.Result
-	MaxLogs      int
-	ScrollOffset int // 0 means waiting at the bottom (auto-scroll), > 0 means scrolled up
+	yellowStyle = lipgloss.NewStyle().
+			Foreground(DraculaYellow)
 
-	// Dimensions
-	Width  int
-	Height int
-}
+	logStyle = lipgloss.NewStyle().
+			Foreground(DraculaFg)
 
-// CommandDef defines a CLI command with help text
+	cmdPromptStyle = lipgloss.NewStyle().
+			Foreground(DraculaPurple).
+			Bold(true)
+)
+
+// CommandDef defines a TUI command.
 type CommandDef struct {
 	Name        string
 	Description string
-	Usage       string
+	Args        string
+	Handler     func(m *Model, args string) string
 }
 
-// AvailableCommands is the static list of all commands
-var AvailableCommands = []CommandDef{
-	{Name: "worker", Description: "Set worker count", Usage: ":worker [int]"},
-	{Name: "set-url", Description: "Set target URL", Usage: ":set-url [URL]"},
-	{Name: "set-ua", Description: "Set User-Agent string", Usage: ":set-ua [AgentString]"},
-	{Name: "set-delay", Description: "Set request delay", Usage: ":set-delay [10ms|1s]"},
-	{Name: "add-header", Description: "Add custom HTTP header", Usage: ":add-header [Key]: [Value]"},
-	{Name: "rm-header", Description: "Remove HTTP header", Usage: ":rm-header [Key]"},
-	{Name: "filter-size", Description: "Filter response size", Usage: ":filter-size [bytes]"},
-	{Name: "rm-filter-size", Description: "Remove size filter", Usage: ":rm-filter-size [bytes]"},
-	{Name: "filter-code", Description: "Add Status Code to Match List", Usage: ":filter-code [200|403]"},
-	{Name: "rm-filter-code", Description: "Remove Status Code from Match List", Usage: ":rm-filter-code [200|403]"},
-	{Name: "add-ext", Description: "Add Extension to scanner", Usage: ":add-ext [php|txt]"},
-	{Name: "rm-ext", Description: "Remove Extension from scanner", Usage: ":rm-ext [php]"},
-	{Name: "set-mutate", Description: "Enable/Disable Smart Mutation", Usage: ":set-mutate [on|off]"},
-	{Name: "wordlist", Description: "Hot-swap wordlist file", Usage: ":wordlist [path]"},
-	{Name: "help", Description: "Show available commands", Usage: ":help"},
+// TickMsg is sent on each tick.
+type TickMsg time.Time
+
+// Model is the BubbleTea model for the TUI.
+type Model struct {
+	Engine        *engine.Engine
+	viewport      viewport.Model
+	textInput     textinput.Model
+	logs          []string
+	commandMode   bool
+	width, height int
+	ready         bool
+
+	// Telemetry display
+	startTime time.Time
+
+	// Command history
+	cmdHistory    []string
+	cmdHistoryIdx int
+
+	// Available commands
+	commands []CommandDef
+
+	// Autocomplete state
+	suggestions    []string
+	selectedSugIdx int
+
+	// State
+	quitting bool
 }
 
-// NewModel initializes the TUI state
-func NewModel(eng *engine.Engine, initialWorkers int) Model {
+// NewModel initializes the TUI model.
+func NewModel(eng *engine.Engine) Model {
 	ti := textinput.New()
-	ti.Placeholder = "Type command..."
-	ti.CharLimit = 156
-	// ti.Width = 50 // Removed fixed width so it can be responsive
+	ti.Placeholder = "Type ':' to enter command mode, 'q' to quit"
+	ti.CharLimit = 256
+	ti.Width = 80
 
-	// Initialize Help Viewport with default content
-	hv := viewport.New(0, 0)
-	helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS (Use arrow keys to scroll):") + "\n" +
-		":run                  - Restart scan with current configs\n" +
-		":set-ua [Agent]       - Set User-Agent\n" +
-		":add-header [K]: [V]  - Set Header\n" +
-		":rm-header [K]        - Remove Header\n" +
-		":set-delay [dur]      - Set Delay (e.g., 50ms)\n" +
-		":worker [int]         - Set Worker threads\n" +
-		":filter-size [bytes]  - Filter by Size\n" +
-		":rm-filter-size [s]   - Remove Size Filter\n" +
-		":filter-code [code]   - Add Status Match\n" +
-		":rm-filter-code [c]   - Remove Status Match\n" +
-		":add-ext [ext]        - Add Extension\n" +
-		":rm-ext [ext]         - Remove Extension\n" +
-		":set-mutate [on|off]  - Toggle Mutation\n" +
-		":wordlist [path]      - Hot-swap Wordlist\n" +
-		":run                  - Resume Scanning"
-	hv.SetContent(helpText)
+	vp := viewport.New(80, 20)
+	vp.SetContent("")
 
-	return Model{
-		Workers:      initialWorkers,
-		MaxLogs:      1000,
-		Logs:         []engine.Result{},
-		Engine:       eng,
-		TextInput:    ti,
-		Suggestions:  []CommandDef{},
-		TopFocused:   false, // Bottom focused by default
-		HelpViewport: hv,
+	m := Model{
+		Engine:    eng,
+		viewport:  vp,
+		textInput: ti,
+		logs:      []string{},
+		startTime: time.Now(),
 	}
+	m.initCommands()
+	return m
 }
 
-// Helper to generate telemetry string for the viewport
-func (m Model) renderTelemetryContent() string {
-
-	// --- Top Half: Telemetry ---
-	status := okStyle.Render("RUNNING (v2)")
-
-	// If in command mode, show PAUSED (CMD) unless manually paused
-	if m.Paused {
-		if m.CommandMode && !m.PrePaused {
-			status = pauseStyle.Render("PAUSED (CMD)")
-		} else {
-			status = pauseStyle.Render("PAUSED")
-		}
-	}
-
-	// Fetch current config for display
-	ua, filters, headers, delay, extensions := m.Engine.ConfigSnapshot()
-	sort.Ints(filters)
-	filtersStr := "None"
-	if len(filters) > 0 {
-		strs := make([]string, len(filters))
-		for i, v := range filters {
-			strs[i] = strconv.Itoa(v)
-		}
-		filtersStr = strings.Join(strs, ",")
-	}
-
-	extentionsStr := "None"
-	if len(extensions) > 0 {
-		extentionsStr = strings.Join(extensions, ",")
-	}
-
-	headersBlock := "             [Headers: None]"
-	if len(headers) > 0 {
-		var hList []string
-		for k, v := range headers {
-			if k != "User-Agent" { // User-Agent is already shown elsewhere usually
-				hList = append(hList, fmt.Sprintf("%s:%s", k, v))
+// initCommands registers all available TUI commands.
+func (m *Model) initCommands() {
+	m.commands = []CommandDef{
+		{Name: "help", Description: "Show all commands", Args: "", Handler: func(m *Model, args string) string {
+			var sb strings.Builder
+			sb.WriteString(pinkStyle.Render("=== DirFuzz Commands ===") + "\n")
+			for _, cmd := range m.commands {
+				line := fmt.Sprintf("  :%s", cmd.Name)
+				if cmd.Args != "" {
+					line += " " + cmd.Args
+				}
+				sb.WriteString(highlightStyle.Render(line) + " - " + mutedStyle.Render(cmd.Description) + "\n")
 			}
-		}
-		sort.Strings(hList)
-		if len(hList) > 0 {
-			var formattedHeaders []string
-			for _, h := range hList {
-				styledHeader := lipgloss.NewStyle().Foreground(draculaGreen).Render(h)
-				formattedHeaders = append(formattedHeaders, fmt.Sprintf("             [Headers: %s]", styledHeader))
+			return sb.String()
+		}},
+		{Name: "pause", Description: "Pause/resume scanning", Args: "", Handler: func(m *Model, args string) string {
+			m.Engine.Config.RLock()
+			p := m.Engine.Config.IsPaused
+			m.Engine.Config.RUnlock()
+			m.Engine.SetPaused(!p)
+			if p {
+				return statusStyle.Render("[*] Scan resumed")
 			}
-			headersBlock = strings.Join(formattedHeaders, "\n")
-		}
+			return orangeStyle.Render("[*] Scan paused")
+		}},
+		{Name: "threads", Description: "Set worker count", Args: "<n>", Handler: func(m *Model, args string) string {
+			n, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil || n < 1 {
+				return errorStyle.Render("Usage: :threads <number>")
+			}
+			m.Engine.SetWorkerCount(n)
+			return statusStyle.Render(fmt.Sprintf("[*] Workers set to %d", n))
+		}},
+		{Name: "delay", Description: "Set delay (ms)", Args: "<ms>", Handler: func(m *Model, args string) string {
+			ms, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil || ms < 0 {
+				return errorStyle.Render("Usage: :delay <milliseconds>")
+			}
+			m.Engine.SetDelay(time.Duration(ms) * time.Millisecond)
+			return statusStyle.Render(fmt.Sprintf("[*] Delay set to %dms", ms))
+		}},
+		{Name: "rps", Description: "Set requests per second (0=unlimited)", Args: "<n>", Handler: func(m *Model, args string) string {
+			n, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil || n < 0 {
+				return errorStyle.Render("Usage: :rps <number>")
+			}
+			m.Engine.SetRPS(n)
+			if n == 0 {
+				return statusStyle.Render("[*] RPS: unlimited")
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] RPS limit set to %d", n))
+		}},
+		{Name: "ua", Description: "Change User-Agent", Args: "<string>", Handler: func(m *Model, args string) string {
+			if strings.TrimSpace(args) == "" {
+				return errorStyle.Render("Usage: :ua <user-agent>")
+			}
+			m.Engine.UpdateUserAgent(strings.TrimSpace(args))
+			return statusStyle.Render("[*] User-Agent updated")
+		}},
+		{Name: "header", Description: "Add header (key:value)", Args: "<key:value>", Handler: func(m *Model, args string) string {
+			parts := strings.SplitN(strings.TrimSpace(args), ":", 2)
+			if len(parts) != 2 {
+				return errorStyle.Render("Usage: :header Key:Value")
+			}
+			m.Engine.AddHeader(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			return statusStyle.Render(fmt.Sprintf("[*] Header set: %s: %s", parts[0], parts[1]))
+		}},
+		{Name: "rmheader", Description: "Remove header", Args: "<key>", Handler: func(m *Model, args string) string {
+			if args == "" {
+				return errorStyle.Render("Usage: :rmheader <key>")
+			}
+			m.Engine.RemoveHeader(strings.TrimSpace(args))
+			return statusStyle.Render(fmt.Sprintf("[*] Header removed: %s", args))
+		}},
+		{Name: "addcode", Description: "Add match status code", Args: "<code>", Handler: func(m *Model, args string) string {
+			code, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :addcode <code>")
+			}
+			m.Engine.AddMatchCode(code)
+			return statusStyle.Render(fmt.Sprintf("[*] Added match code: %d", code))
+		}},
+		{Name: "rmcode", Description: "Remove match status code", Args: "<code>", Handler: func(m *Model, args string) string {
+			code, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :rmcode <code>")
+			}
+			m.Engine.RemoveMatchCode(code)
+			return statusStyle.Render(fmt.Sprintf("[*] Removed match code: %d", code))
+		}},
+		{Name: "filter", Description: "Add filtered size", Args: "<size>", Handler: func(m *Model, args string) string {
+			size, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :filter <size>")
+			}
+			m.Engine.AddFilterSize(size)
+			return statusStyle.Render(fmt.Sprintf("[*] Filtering size: %d", size))
+		}},
+		{Name: "rmfilter", Description: "Remove filtered size", Args: "<size>", Handler: func(m *Model, args string) string {
+			size, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :rmfilter <size>")
+			}
+			m.Engine.RemoveFilterSize(size)
+			return statusStyle.Render(fmt.Sprintf("[*] Removed filter size: %d", size))
+		}},
+		{Name: "addext", Description: "Add extension", Args: "<ext>", Handler: func(m *Model, args string) string {
+			ext := strings.TrimSpace(args)
+			if ext == "" {
+				return errorStyle.Render("Usage: :addext <extension>")
+			}
+			m.Engine.AddExtension(ext)
+			return statusStyle.Render(fmt.Sprintf("[*] Added extension: %s", ext))
+		}},
+		{Name: "rmext", Description: "Remove extension", Args: "<ext>", Handler: func(m *Model, args string) string {
+			ext := strings.TrimSpace(args)
+			if ext == "" {
+				return errorStyle.Render("Usage: :rmext <extension>")
+			}
+			m.Engine.RemoveExtension(ext)
+			return statusStyle.Render(fmt.Sprintf("[*] Removed extension: %s", ext))
+		}},
+		{Name: "mutate", Description: "Toggle mutation", Args: "", Handler: func(m *Model, args string) string {
+			m.Engine.Config.RLock()
+			current := m.Engine.Config.Mutate
+			m.Engine.Config.RUnlock()
+			m.Engine.SetMutation(!current)
+			if !current {
+				return statusStyle.Render("[*] Mutation enabled")
+			}
+			return orangeStyle.Render("[*] Mutation disabled")
+		}},
+		{Name: "wordlist", Description: "Change wordlist", Args: "<path>", Handler: func(m *Model, args string) string {
+			path := strings.TrimSpace(args)
+			if path == "" {
+				return errorStyle.Render("Usage: :wordlist <path>")
+			}
+			if err := m.Engine.ChangeWordlist(path); err != nil {
+				return errorStyle.Render(fmt.Sprintf("Error: %v", err))
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] Wordlist changed to: %s", path))
+		}},
+		{Name: "restart", Description: "Restart scan", Args: "", Handler: func(m *Model, args string) string {
+			if err := m.Engine.Restart(); err != nil {
+				return errorStyle.Render(fmt.Sprintf("Error: %v", err))
+			}
+			return statusStyle.Render("[*] Scan restarted")
+		}},
+		{Name: "config", Description: "Show current config", Args: "", Handler: func(m *Model, args string) string {
+			ua, filters, headers, delay, exts := m.Engine.ConfigSnapshot()
+			m.Engine.Config.RLock()
+			recursive := m.Engine.Config.Recursive
+			maxDepth := m.Engine.Config.MaxDepth
+			mutate := m.Engine.Config.Mutate
+			matchRegex := m.Engine.Config.MatchRegex
+			filterRegex := m.Engine.Config.FilterRegex
+			filterWords := m.Engine.Config.FilterWords
+			filterLines := m.Engine.Config.FilterLines
+			followRedir := m.Engine.Config.FollowRedirects
+			body := m.Engine.Config.RequestBody
+			outputFmt := m.Engine.Config.OutputFormat
+			m.Engine.Config.RUnlock()
+
+			var sb strings.Builder
+			sb.WriteString(pinkStyle.Render("=== Current Config ===") + "\n")
+			sb.WriteString(fmt.Sprintf("  Target:     %s\n", highlightStyle.Render(m.Engine.BaseURL())))
+			sb.WriteString(fmt.Sprintf("  UA:         %s\n", ua))
+			sb.WriteString(fmt.Sprintf("  Delay:      %s\n", delay))
+			sb.WriteString(fmt.Sprintf("  Extensions: %v\n", exts))
+			sb.WriteString(fmt.Sprintf("  Filters:    %v\n", filters))
+			sb.WriteString(fmt.Sprintf("  Headers:    %v\n", headers))
+			sb.WriteString(fmt.Sprintf("  Recursive:  %v (depth: %d)\n", recursive, maxDepth))
+			sb.WriteString(fmt.Sprintf("  Mutate:     %v\n", mutate))
+			sb.WriteString(fmt.Sprintf("  Follow:     %v\n", followRedir))
+			sb.WriteString(fmt.Sprintf("  OutputFmt:  %s\n", outputFmt))
+			if matchRegex != "" {
+				sb.WriteString(fmt.Sprintf("  MatchRegex: %s\n", matchRegex))
+			}
+			if filterRegex != "" {
+				sb.WriteString(fmt.Sprintf("  FilterRegex: %s\n", filterRegex))
+			}
+			if filterWords >= 0 {
+				sb.WriteString(fmt.Sprintf("  FilterWords: %d\n", filterWords))
+			}
+			if filterLines >= 0 {
+				sb.WriteString(fmt.Sprintf("  FilterLines: %d\n", filterLines))
+			}
+			if body != "" {
+				sb.WriteString(fmt.Sprintf("  Body:       %s\n", body))
+			}
+			return sb.String()
+		}},
+		{Name: "mr", Description: "Set match regex", Args: "<pattern>", Handler: func(m *Model, args string) string {
+			pattern := strings.TrimSpace(args)
+			if err := m.Engine.SetMatchRegex(pattern); err != nil {
+				return errorStyle.Render(fmt.Sprintf("Invalid regex: %v", err))
+			}
+			if pattern == "" {
+				return statusStyle.Render("[*] Match regex cleared")
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] Match regex set: %s", pattern))
+		}},
+		{Name: "fr", Description: "Set filter regex", Args: "<pattern>", Handler: func(m *Model, args string) string {
+			pattern := strings.TrimSpace(args)
+			if err := m.Engine.SetFilterRegex(pattern); err != nil {
+				return errorStyle.Render(fmt.Sprintf("Invalid regex: %v", err))
+			}
+			if pattern == "" {
+				return statusStyle.Render("[*] Filter regex cleared")
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] Filter regex set: %s", pattern))
+		}},
+		{Name: "fw", Description: "Filter by word count (-1 = off)", Args: "<count>", Handler: func(m *Model, args string) string {
+			n, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :fw <number>")
+			}
+			m.Engine.Config.Lock()
+			m.Engine.Config.FilterWords = n
+			m.Engine.Config.Unlock()
+			if n < 0 {
+				return statusStyle.Render("[*] Word filter disabled")
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] Filter words: %d", n))
+		}},
+		{Name: "fl", Description: "Filter by line count (-1 = off)", Args: "<count>", Handler: func(m *Model, args string) string {
+			n, err := strconv.Atoi(strings.TrimSpace(args))
+			if err != nil {
+				return errorStyle.Render("Usage: :fl <number>")
+			}
+			m.Engine.Config.Lock()
+			m.Engine.Config.FilterLines = n
+			m.Engine.Config.Unlock()
+			if n < 0 {
+				return statusStyle.Render("[*] Line filter disabled")
+			}
+			return statusStyle.Render(fmt.Sprintf("[*] Filter lines: %d", n))
+		}},
+		{Name: "follow", Description: "Toggle redirect following", Args: "", Handler: func(m *Model, args string) string {
+			m.Engine.Config.RLock()
+			current := m.Engine.Config.FollowRedirects
+			m.Engine.Config.RUnlock()
+			m.Engine.SetFollowRedirects(!current)
+			if !current {
+				return statusStyle.Render("[*] Follow redirects enabled")
+			}
+			return orangeStyle.Render("[*] Follow redirects disabled")
+		}},
+		{Name: "body", Description: "Set request body for POST/PUT", Args: "<body>", Handler: func(m *Model, args string) string {
+			m.Engine.Config.Lock()
+			m.Engine.Config.RequestBody = strings.TrimSpace(args)
+			m.Engine.Config.Unlock()
+			if args == "" {
+				return statusStyle.Render("[*] Request body cleared")
+			}
+			return statusStyle.Render("[*] Request body set")
+		}},
+		{Name: "clear", Description: "Clear log output", Args: "", Handler: func(m *Model, args string) string {
+			m.logs = []string{}
+			m.viewport.SetContent("")
+			return ""
+		}},
 	}
-
-	displayUA := ua
-
-	// Left Side: Telemetry
-	targetURL := m.Engine.BaseURL()
-	telemetryLeft := fmt.Sprintf(
-		"%s\n\n"+
-			"Target URL:  %s\n"+
-			"Status:      %s\n"+
-			"Workers:     %s (Press L/R or :worker)\n"+
-			"Progress:    %s\n"+
-			"RPS:         %s\n"+
-			"Params:      [Delay: %s]\n"+
-			"Queue Size:  %s\n\n"+
-			"Config:      [UA: %s]\n"+
-			"             [Filter Sizes: %s]\n"+
-			"             [Ext: %s]\n"+
-			"%s\n\n"+
-			"Errors:      [Conn: %s] [403: %s]  [429: %s]  [500: %s]\n\n"+
-			"Controls:    [Tab] Switch Focus  [p] Pause/Resume  [:] Command",
-		titleStyle.Render("DirFuzz Telemetry"),
-		lipgloss.NewStyle().Foreground(draculaPink).Render(targetURL),
-		status,
-		infoStyle.Render(fmt.Sprintf("%d", m.Workers)),
-		lipgloss.NewStyle().Foreground(draculaCyan).Render(fmt.Sprintf("%d/%d", m.ProgressCurrent, m.ProgressTotal)),
-		infoStyle.Render(fmt.Sprintf("%d", m.RPS)),
-		lipgloss.NewStyle().Foreground(draculaPink).Render(delay.String()),
-		infoStyle.Render(fmt.Sprintf("%d", m.QueueSize)),
-		lipgloss.NewStyle().Foreground(draculaOrange).Render(displayUA),
-		lipgloss.NewStyle().Foreground(draculaYellow).Render(filtersStr),
-		lipgloss.NewStyle().Foreground(draculaPurple).Render(extentionsStr),
-		headersBlock,
-		errStyle.Render(fmt.Sprintf("%d", m.ErrConn)),
-		warnStyle.Render(fmt.Sprintf("%d", m.Err403)),
-		warnStyle.Render(fmt.Sprintf("%d", m.Err429)),
-		errStyle.Render(fmt.Sprintf("%d", m.Err500)),
-	)
-
-	if m.StatusStr != "" {
-		// Use green/cyan for success-like messages to differentiate from red errors
-		style := lipgloss.NewStyle().Foreground(draculaGreen)
-		if strings.HasPrefix(m.StatusStr, "Error:") {
-			style = errStyle
-		}
-		telemetryLeft += "\n\n" + style.Render(m.StatusStr)
-	}
-
-	return telemetryLeft
 }
 
 func tickCmd() tea.Cmd {
-	return tea.Tick(time.Millisecond*500, func(t time.Time) tea.Msg {
+	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
 		return TickMsg(t)
 	})
 }
 
 func (m Model) Init() tea.Cmd {
-	// Start the tick timer for UI refreshes (if needed for animations/time)
-	// Also focus input just in case, though we only need it in command mode
-	// And start listening for engine results
-	return tea.Batch(
-		tickCmd(),
-		textinput.Blink,
-	)
+	return tea.Batch(tickCmd(), m.listenForResults())
+}
+
+// ResultMsg wraps a result coming from the engine.
+type ResultMsg engine.Result
+
+// listenForResults returns a command that reads from the Results channel.
+func (m Model) listenForResults() tea.Cmd {
+	return func() tea.Msg {
+		result, ok := <-m.Engine.Results
+		if !ok {
+			return nil
+		}
+		return ResultMsg(result)
+	}
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var inputCmd tea.Cmd
-
-	// Update Top Viewport Content on every relevant cycle (stats/logs/commands)
-	// We do this preemptively or reactively. Let's do it reactively at end, but we need 'm' updated first.
-	// Actually, viewport.SetContent() doesn't trigger a re-render unless View() is called.
-	// But scrolling state is in Viewport.
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-
-	// Handle keyboard events
-	case tea.KeyMsg:
-		// Command Mode Logic
-		if m.CommandMode {
-			// Always allow scrolling Help Viewport with Page keys while in command mode
-			if msg.String() == "pgup" {
-				m.HelpViewport.LineUp(5)
-				return m, nil
-			} else if msg.String() == "pgdown" {
-				m.HelpViewport.LineDown(5)
-				return m, nil
-			} else if msg.String() == "up" && len(m.Suggestions) == 0 {
-				m.HelpViewport.LineUp(1)
-				return m, nil
-			} else if msg.String() == "down" && len(m.Suggestions) == 0 {
-				m.HelpViewport.LineDown(1)
-				return m, nil
-			}
-
-			// If not a scroll key, reset status string on typing
-			if msg.Type != tea.KeyEnter {
-				// m.StatusStr = "" // Optional: Clear status on new typing? Keeps errors visible until next enter.
-			}
-
-			switch msg.Type {
-			case tea.KeyEnter:
-				val := m.TextInput.Value()
-				m.StatusStr = "" // Clear previous status
-
-				// Empty command -> Restore Pause State / Exit Command Mode
-				if strings.TrimSpace(val) == "" {
-					m.CommandMode = false
-					m.TextInput.Blur()
-					m.TextInput.Reset()
-					// Restore previous pause state
-					m.Paused = m.PrePaused
-					m.Engine.SetPaused(m.Paused)
-
-					// Full width for viewport when leaving command mode
-					m.Viewport.Width = m.Width - 4
-					m.updateTelemetry()
-					m.Viewport.GotoTop()
-					return m, nil
-				}
-
-				// Execute the command
-				if err := m.ExecuteCommand(val); err != nil {
-					m.StatusStr = fmt.Sprintf("Error: %v", err)
-				}
-
-				isHelp := strings.TrimSpace(strings.TrimPrefix(val, ":")) == "help"
-				isRun := strings.TrimSpace(strings.TrimPrefix(val, ":")) == "run"
-
-				if isRun {
-					// Resume Logic
-					m.CommandMode = false
-					m.TextInput.Blur()
-					m.TextInput.Reset()
-					m.Engine.SetPaused(false)
-					m.Paused = false
-					// Full width for viewport
-					m.Viewport.Width = m.Width - 4
-					m.updateTelemetry()
-					m.Viewport.GotoTop()
-				} else {
-					// Stay in Command Mode for chaining
-					m.TextInput.SetValue("") // Clear input for next command
-
-					// Update view so user sees the change (e.g. added header)
-					m.updateTelemetry()
-
-					// If help was shown, scroll to bottom so they see it
-					if isHelp {
-						m.HelpViewport.GotoTop()
-					} else {
-						m.Viewport.GotoBottom()
-					}
-					// Keep suggestions cleared until typing starts again
-					m.Suggestions = []CommandDef{}
-				}
-
-				return m, nil
-
-			case tea.KeyEsc:
-				m.CommandMode = false
-				m.TextInput.Blur()
-				m.TextInput.Reset()
-				// Restore previous pause state
-				m.Paused = m.PrePaused
-				m.Engine.SetPaused(m.Paused)
-				m.Suggestions = []CommandDef{}
-				// Full width for viewport
-				m.Viewport.Width = m.Width - 4
-				m.updateTelemetry()
-
-			case tea.KeyTab:
-				// Autocomplete
-				if len(m.Suggestions) > 0 {
-					selected := m.Suggestions[m.SuggestionIndex]
-					val := selected.Name
-					if !strings.HasSuffix(val, string(os.PathSeparator)) {
-						val += " "
-					}
-					m.TextInput.SetValue(val)
-					m.TextInput.CursorEnd()
-					m.Suggestions = []CommandDef{}
-				}
-
-			case tea.KeyUp:
-				if len(m.Suggestions) > 0 {
-					m.SuggestionIndex--
-					if m.SuggestionIndex < 0 {
-						m.SuggestionIndex = len(m.Suggestions) - 1
-					}
-				} else {
-					// No suggestions -> Scroll Help Viewport Up
-					m.HelpViewport.LineUp(1)
-				}
-
-			case tea.KeyDown:
-				if len(m.Suggestions) > 0 {
-					m.SuggestionIndex++
-					if m.SuggestionIndex >= len(m.Suggestions) {
-						m.SuggestionIndex = 0
-					}
-				} else {
-					// No suggestions -> Scroll Help Viewport Down
-					m.HelpViewport.LineDown(1)
-				}
-			}
-
-			m.TextInput, inputCmd = m.TextInput.Update(msg)
-
-			// Recalculate suggestions based on current input
-			inputVal := strings.TrimSpace(m.TextInput.Value())
-			m.Suggestions = []CommandDef{}
-
-			// Check if we are typing a wordlist command to give file suggestions
-			if strings.HasPrefix(inputVal, "wordlist ") {
-				pathPart := strings.TrimSpace(strings.TrimPrefix(inputVal, "wordlist "))
-				searchPattern := pathPart + "*"
-				if pathPart == "" {
-					searchPattern = "*"
-				}
-				// Expand ~
-				if strings.HasPrefix(pathPart, "~") {
-					home, err := os.UserHomeDir()
-					if err == nil {
-						expanded := strings.Replace(pathPart, "~", home, 1)
-						searchPattern = expanded + "*"
-					}
-				}
-
-				matches, err := filepath.Glob(searchPattern)
-				if err == nil {
-					sort.Strings(matches)
-					// Special case for incomplete filename
-					if len(matches) == 0 {
-						dir, file := filepath.Split(pathPart)
-						if dir == "" {
-							dir = "."
-						}
-						searchDir := dir
-						if strings.HasPrefix(searchDir, "~") {
-							home, _ := os.UserHomeDir()
-							searchDir = strings.Replace(searchDir, "~", home, 1)
-						}
-						globPattern := filepath.Join(searchDir, file+"*")
-						matches, _ = filepath.Glob(globPattern)
-					}
-
-					m.Suggestions = []CommandDef{}
-					for _, match := range matches {
-						displayName := match
-						if strings.HasPrefix(pathPart, "~") {
-							home, _ := os.UserHomeDir()
-							if strings.HasPrefix(match, home) {
-								displayName = strings.Replace(match, home, "~", 1)
-							}
-						}
-
-						info, err := os.Stat(match)
-						if err == nil {
-							desc := "File"
-							if info.IsDir() {
-								desc = "Directory"
-								displayName += string(os.PathSeparator)
-							}
-							m.Suggestions = append(m.Suggestions, CommandDef{
-								Name:        "wordlist " + displayName,
-								Description: desc,
-								Usage:       ":wordlist " + displayName,
-							})
-						}
-					}
-					// Sort dirs first
-					sort.Slice(m.Suggestions, func(i, j int) bool {
-						iDir := m.Suggestions[i].Description == "Directory"
-						jDir := m.Suggestions[j].Description == "Directory"
-						if iDir && !jDir {
-							return true
-						}
-						return m.Suggestions[i].Name < m.Suggestions[j].Name
-					})
-				}
-				if len(m.Suggestions) > 10 {
-					m.Suggestions = m.Suggestions[:10]
-				}
-
-			} else if inputVal != "" {
-				for _, cmdDef := range AvailableCommands {
-					if strings.HasPrefix(cmdDef.Name, inputVal) {
-						m.Suggestions = append(m.Suggestions, cmdDef)
-					}
-				}
-			} else {
-				for _, cmdDef := range AvailableCommands {
-					m.Suggestions = append(m.Suggestions, cmdDef)
-				}
-			}
-
-			// Reset index
-			if m.SuggestionIndex >= len(m.Suggestions) {
-				m.SuggestionIndex = 0
-			}
-
-			return m, inputCmd
-		} else {
-			// Normal Mode Logic
-			switch msg.String() {
-			case "q", "ctrl+c":
-				return m, tea.Quit
-			case ":":
-				m.PrePaused = m.Paused // Save user's pause state
-				m.CommandMode = true
-
-				// Resize Viewports for side-by-side view
-				if m.Width > 0 {
-					telemetryWidth := int(float64(m.Width-4) * 0.6)
-					helpWidth := (m.Width - 4) - telemetryWidth - 3
-
-					m.Viewport.Width = telemetryWidth
-					m.updateTelemetry()
-
-					m.HelpViewport.Width = helpWidth
-					// Re-set help content to ensure proper wrapping if needed
-					helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS:") + "\n" +
-						":run                  - Restart scan with current configs\n" +
-						":set-url [URL]        - Set Target URL\n" +
-						":set-ua [Agent]       - Set User-Agent\n" +
-						":add-header [K]: [V]  - Set Header\n" +
-						":rm-header [K]        - Remove Header\n" +
-						":set-delay [dur]      - Set Delay (e.g., 50ms)\n" +
-						":worker [int]         - Set Worker threads\n" +
-						":filter-size [bytes]  - Filter by Size\n" +
-						":rm-filter-size [s]   - Remove Size Filter\n" +
-						":filter-code [code]   - Add Status Match\n" +
-						":rm-filter-code [c]   - Remove Status Match\n" +
-						":add-ext [ext]        - Add Extension\n" +
-						":rm-ext [ext]         - Remove Extension\n" +
-						":set-mutate [on|off]  - Toggle Mutation\n" +
-						":wordlist [path]      - Hot-swap Wordlist\n" +
-						":run                  - Resume Scanning"
-					m.HelpViewport.SetContent(helpText)
-				}
-
-				m.TextInput.Focus()
-				m.Engine.SetPaused(true)
-				m.Paused = true
-				m.Suggestions = []CommandDef{}
-				for _, cmdDef := range AvailableCommands {
-					m.Suggestions = append(m.Suggestions, cmdDef)
-				}
-				return m, nil
-			case "p":
-				m.Paused = !m.Paused
-				m.Engine.SetPaused(m.Paused)
-				m.updateTelemetry()
-			case "tab":
-				m.TopFocused = !m.TopFocused
-				return m, nil
-			}
-
-			if m.TopFocused {
-				// Handle Scroll Keys for Viewport
-				var vpCmd tea.Cmd
-				m.Viewport, vpCmd = m.Viewport.Update(msg)
-				return m, vpCmd
-			} else {
-				// Handle Scroll Keys for Logs (Legacy)
-				switch msg.String() {
-				// Worker Control
-				case "Right", "l":
-					m.Workers++
-					m.Engine.SetWorkerCount(m.Workers)
-				case "Left", "h":
-					if m.Workers > 1 {
-						m.Workers--
-						m.Engine.SetWorkerCount(m.Workers)
-					}
-				// Scrolling
-				case "pgup": // Page Up
-					m.ScrollOffset += 10
-					if m.ScrollOffset > len(m.Logs) {
-						m.ScrollOffset = len(m.Logs)
-					}
-				case "pgdown": // Page Down
-					m.ScrollOffset -= 10
-					if m.ScrollOffset < 0 {
-						m.ScrollOffset = 0
-					}
-				case "up", "k": // Scroll Up
-					m.ScrollOffset++
-					if m.ScrollOffset > len(m.Logs) {
-						m.ScrollOffset = len(m.Logs)
-					}
-				case "down", "j": // Scroll Down
-					m.ScrollOffset--
-					if m.ScrollOffset < 0 {
-						m.ScrollOffset = 0
-					}
-				}
-			}
-		}
-
-		// Handle Mouse scrolling
-	case tea.MouseMsg:
-		var cmd tea.Cmd
-		if msg.Type == tea.MouseWheelUp || msg.Type == tea.MouseWheelDown {
-			if m.TopFocused {
-				m.Viewport, cmd = m.Viewport.Update(msg)
-			} else if m.CommandMode {
-				m.HelpViewport, cmd = m.HelpViewport.Update(msg)
-			}
-			return m, cmd
-		}
-
-	// Handle window resizing
 	case tea.WindowSizeMsg:
-		m.Width = msg.Width
-		m.Height = msg.Height
-
-		// Initialize Viewport if needed
-		headerHeight := lipgloss.Height(m.renderTelemetryContent())
-		// Actually, we want a fixed or percentage size for top view?
-		// The original logic was dynamic size based on content.
-		// If content is huge, we should limit it.
-		// Let's say top view is Max 50% of screen height, otherwise scrollable.
-		// Wait, headerHeight is the *full* content height.
-
-		maxTopHeight := msg.Height / 2
-		if headerHeight > maxTopHeight {
-			headerHeight = maxTopHeight
+		m.width = msg.Width
+		m.height = msg.Height
+		headerHeight := 10
+		footerHeight := 3
+		vpHeight := m.height - headerHeight - footerHeight
+		if vpHeight < 5 {
+			vpHeight = 5
 		}
-		// Or maybe a minimum height?
-		if headerHeight < 10 {
-			headerHeight = 10
+		vpWidth := m.width - 2
+		if vpWidth < 20 {
+			vpWidth = 20
 		}
-
-		telemetryWidth := msg.Width - 4
-		helpWidth := 0
-
-		if m.CommandMode {
-			// Split view: 60% / 40%
-			telemetryWidth = int(float64(msg.Width-4) * 0.6)
-			helpWidth = (msg.Width - 4) - telemetryWidth - 3 // -3 for gap
+		if !m.ready {
+			m.viewport = viewport.New(vpWidth, vpHeight)
+			m.viewport.SetContent(strings.Join(m.logs, "\n"))
+			m.ready = true
+		} else {
+			m.viewport.Width = vpWidth
+			m.viewport.Height = vpHeight
 		}
+		m.textInput.Width = vpWidth - 4
 
-		m.Viewport = viewport.New(telemetryWidth, headerHeight)
-		m.Viewport.YPosition = 0
-		m.Viewport.HighPerformanceRendering = false
-		m.updateTelemetry()
-
-		m.HelpViewport = viewport.New(helpWidth, headerHeight)
-		m.HelpViewport.SetContent(m.HelpViewport.View()) // Keeps content, update size
-		// Re-set help content to be safe
-		helpText := lipgloss.NewStyle().Foreground(draculaPink).Render("AVAILABLE COMMANDS:") + "\n" +
-			":run                  - Restart scan with current configs\n" +
-			":set-ua [Agent]       - Set User-Agent\n" +
-			":add-header [K]: [V]  - Set Header\n" +
-			":rm-header [K]        - Remove Header\n" +
-			":set-delay [dur]      - Set Delay (e.g., 50ms)\n" +
-			":worker [int]         - Set Worker threads\n" +
-			":filter-size [bytes]  - Filter by Size\n" +
-			":rm-filter-size [s]   - Remove Size Filter\n" +
-			":filter-code [code]   - Add Status Match\n" +
-			":rm-filter-code [c]   - Remove Status Match\n" +
-			":add-ext [ext]        - Add Extension\n" +
-			":rm-ext [ext]         - Remove Extension\n" +
-			":set-mutate [on|off]  - Toggle Mutation\n" +
-			":wordlist [path]      - Hot-swap Wordlist\n" +
-			":run                  - Resume Scanning"
-		m.HelpViewport.SetContent(helpText)
-
-	// Handle incoming telemetry stats
-	case StatsMsg:
-		m.RPS = msg.RPS
-		m.QueueSize = msg.QueueSize
-		m.Err403 = msg.Err403
-		m.Err429 = msg.Err429
-		m.Err500 = msg.Err500
-		m.updateTelemetry()
-
-	// Handle incoming successful logs
-	case LogMsg:
-		// Append new log
-		m.Logs = append(m.Logs, engine.Result(msg))
-		if len(m.Logs) > m.MaxLogs {
-			m.Logs = m.Logs[1:] // Remove oldest log
-		}
-		// Continue waiting for more logs
-		return m, nil
-
-	// Handle periodic ticks
 	case TickMsg:
-		// Update stats from Engine on every tick
-		// Access atomic variables directly from engine
-		m.ProgressTotal = atomic.LoadInt64(&m.Engine.TotalLines)
-		m.ProgressCurrent = atomic.LoadInt64(&m.Engine.ProcessedLines)
+		m.Engine.UpdateRPS()
+		cmds = append(cmds, tickCmd())
 
-		// Update Telemetry
-		m.QueueSize = m.Engine.QueueSize()
-		m.Err403 = int(atomic.LoadInt64(&m.Engine.Count403))
-		m.Err429 = int(atomic.LoadInt64(&m.Engine.Count429))
-		m.Err500 = int(atomic.LoadInt64(&m.Engine.Count500))
-		m.ErrConn = int(atomic.LoadInt64(&m.Engine.CountConnErr))
+	case ResultMsg:
+		result := engine.Result(msg)
+		if result.IsAutoFilter {
+			msgStr := ""
+			if result.Headers != nil {
+				msgStr = result.Headers["Msg"]
+			}
+			if msgStr != "" {
+				m.appendLog(orangeStyle.Render(fmt.Sprintf("[!] %s: %s", result.Path, msgStr)))
+			}
+		} else if result.IsEagleAlert {
+			m.appendLog(yellowStyle.Render(fmt.Sprintf("[EAGLE] %s changed: %d -> %d", result.Path, result.OldStatusCode, result.StatusCode)))
+		} else {
+			m.appendLog(formatResult(result))
+		}
+		cmds = append(cmds, m.listenForResults())
 
-		m.updateTelemetry() // Should force viewport update
-		return m, tickCmd()
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+
+		case "q":
+			if !m.commandMode {
+				m.quitting = true
+				return m, tea.Quit
+			}
+
+		case ":":
+			if !m.commandMode {
+				m.commandMode = true
+				m.textInput.SetValue("")
+				m.textInput.Focus()
+				m.suggestions = nil
+				m.selectedSugIdx = 0
+				return m, nil
+			}
+
+		case "esc":
+			if m.commandMode {
+				m.commandMode = false
+				m.textInput.Blur()
+				m.suggestions = nil
+				return m, nil
+			}
+
+		case "enter":
+			if m.commandMode {
+				val := strings.TrimSpace(m.textInput.Value())
+				if val != "" {
+					output := m.executeCommand(val)
+					if output != "" {
+						m.appendLog(output)
+					}
+					m.cmdHistory = append(m.cmdHistory, val)
+					m.cmdHistoryIdx = len(m.cmdHistory)
+				}
+				m.commandMode = false
+				m.textInput.Blur()
+				m.textInput.SetValue("")
+				m.suggestions = nil
+				return m, nil
+			}
+
+		case "up":
+			if m.commandMode && len(m.suggestions) > 0 {
+				m.selectedSugIdx--
+				if m.selectedSugIdx < 0 {
+					m.selectedSugIdx = len(m.suggestions) - 1
+				}
+				return m, nil
+			}
+			if m.commandMode && len(m.cmdHistory) > 0 {
+				if m.cmdHistoryIdx > 0 {
+					m.cmdHistoryIdx--
+					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
+				}
+				return m, nil
+			}
+
+		case "down":
+			if m.commandMode && len(m.suggestions) > 0 {
+				m.selectedSugIdx++
+				if m.selectedSugIdx >= len(m.suggestions) {
+					m.selectedSugIdx = 0
+				}
+				return m, nil
+			}
+			if m.commandMode && len(m.cmdHistory) > 0 {
+				if m.cmdHistoryIdx < len(m.cmdHistory)-1 {
+					m.cmdHistoryIdx++
+					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
+				}
+				return m, nil
+			}
+
+		case "tab":
+			if m.commandMode && len(m.suggestions) > 0 {
+				m.textInput.SetValue(m.suggestions[m.selectedSugIdx] + " ")
+				m.suggestions = nil
+				return m, nil
+			}
+		}
+
+		if m.commandMode {
+			var cmd tea.Cmd
+			m.textInput, cmd = m.textInput.Update(msg)
+			cmds = append(cmds, cmd)
+
+			// Autocomplete
+			val := m.textInput.Value()
+			if val != "" {
+				m.suggestions = nil
+				for _, c := range m.commands {
+					if strings.HasPrefix(c.Name, val) {
+						m.suggestions = append(m.suggestions, c.Name)
+					}
+				}
+				m.selectedSugIdx = 0
+			} else {
+				m.suggestions = nil
+			}
+			return m, tea.Batch(cmds...)
+		}
+
+		// Non-command mode key shortcuts
+		switch msg.String() {
+		case "p":
+			m.Engine.Config.RLock()
+			p := m.Engine.Config.IsPaused
+			m.Engine.Config.RUnlock()
+			m.Engine.SetPaused(!p)
+			if p {
+				m.appendLog(statusStyle.Render("[*] Scan resumed"))
+			} else {
+				m.appendLog(orangeStyle.Render("[*] Scan paused"))
+			}
+		case "?":
+			output := m.commands[0].Handler(&m, "")
+			m.appendLog(output)
+		}
 	}
 
-	return m, nil
+	// Update viewport
+	if m.ready {
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		cmds = append(cmds, cmd)
+	}
+
+	return m, tea.Batch(cmds...)
 }
 
-func (m *Model) ExecuteCommand(raw string) error {
-	raw = strings.TrimPrefix(raw, ":")
-	parts := strings.SplitN(raw, " ", 2)
-	command := parts[0]
+func (m *Model) appendLog(text string) {
+	if text == "" {
+		return
+	}
+	m.logs = append(m.logs, text)
+	m.viewport.SetContent(strings.Join(m.logs, "\n"))
+	m.viewport.GotoBottom()
+}
+
+// executeCommand parses and runs a TUI command.
+func (m *Model) executeCommand(input string) string {
+	parts := strings.SplitN(input, " ", 2)
+	name := strings.ToLower(parts[0])
 	args := ""
 	if len(parts) > 1 {
 		args = parts[1]
 	}
 
-	switch command {
-	case "run":
-		err := m.Engine.Restart()
-		if err != nil {
-			return fmt.Errorf("failed to restart: %v", err)
+	for _, cmd := range m.commands {
+		if cmd.Name == name {
+			return cmd.Handler(m, args)
 		}
-		// Clear viewport results from previous run
-		m.Logs = []engine.Result{}
-		m.ScrollOffset = 0
-		m.StatusStr = "Scan restarted with updated configuration!"
-	case "set-url":
-		if args == "" {
-			return fmt.Errorf("usage: :set-url [URL]")
-		}
-		if err := m.Engine.SetTarget(args); err != nil {
-			return fmt.Errorf("invalid URL: %v", err)
-		}
-		m.StatusStr = fmt.Sprintf("URL updated to %s", args)
-	case "set-ua":
-		if args == "" {
-			return fmt.Errorf("usage: :set-ua [value]")
-		}
-		m.Engine.UpdateUserAgent(args)
-	case "add-header":
-		// Expect Key: Value
-		if !strings.Contains(args, ":") {
-			return fmt.Errorf("usage: :add-header Key: Value")
-		}
-		headerParts := strings.SplitN(args, ":", 2)
-		key := strings.TrimSpace(headerParts[0])
-		val := strings.TrimSpace(headerParts[1])
-
-		// Check for duplicate header
-		if _, exists := m.Engine.Config.Headers[key]; exists {
-			return fmt.Errorf("header %s already exists", key)
-		}
-		m.Engine.AddHeader(key, val)
-	case "set-delay":
-		d, err := time.ParseDuration(strings.TrimSpace(args))
-		if err != nil {
-			return fmt.Errorf("invalid duration format (e.g. 100ms, 1s)")
-		}
-		m.Engine.SetDelay(d)
-	case "worker":
-		n, err := strconv.Atoi(strings.TrimSpace(args))
-		if err != nil || n < 1 {
-			return fmt.Errorf("invalid worker count")
-		}
-		m.Workers = n // Update TUI view immediately
-		m.Engine.SetWorkerCount(n)
-	case "filter-size":
-		size, err := strconv.Atoi(strings.TrimSpace(args))
-		if err != nil {
-			return fmt.Errorf("invalid size")
-		}
-		m.Engine.AddFilterSize(size)
-	case "rm-filter-size":
-		size, err := strconv.Atoi(strings.TrimSpace(args))
-		if err != nil {
-			return fmt.Errorf("invalid size")
-		}
-		m.Engine.RemoveFilterSize(size)
-	case "rm-header":
-		if args == "" {
-			return fmt.Errorf("usage: :rm-header [Key]")
-		}
-		m.Engine.RemoveHeader(strings.TrimSpace(args))
-	case "wordlist":
-		if args == "" {
-			return fmt.Errorf("usage: :wordlist path/to/file")
-		}
-		if err := m.Engine.ChangeWordlist(args); err != nil {
-			return err
-		}
-	case "filter-code":
-		code, err := strconv.Atoi(strings.TrimSpace(args))
-		if err != nil {
-			return fmt.Errorf("invalid status code")
-		}
-		m.Engine.AddMatchCode(code)
-	case "rm-filter-code":
-		code, err := strconv.Atoi(strings.TrimSpace(args))
-		if err != nil {
-			return fmt.Errorf("invalid status code")
-		}
-		m.Engine.RemoveMatchCode(code)
-	case "add-ext":
-		if args == "" {
-			return fmt.Errorf("usage: :add-ext [ext]")
-		}
-		// Extensions usually start with .
-		ext := strings.TrimSpace(args)
-		m.Engine.AddExtension(ext)
-	case "rm-ext":
-		if args == "" {
-			return fmt.Errorf("usage: :rm-ext [ext]")
-		}
-		ext := strings.TrimSpace(args)
-		m.Engine.RemoveExtension(ext)
-	case "set-mutate":
-		val := strings.ToLower(strings.TrimSpace(args))
-		if val == "on" || val == "true" || val == "1" {
-			m.Engine.SetMutation(true)
-		} else if val == "off" || val == "false" || val == "0" {
-			m.Engine.SetMutation(false)
-		} else {
-			return fmt.Errorf("usage: :set-mutate [on|off]")
-		}
-
-	case "help":
-		// Detailed help message
-		m.StatusStr = "COMMAND LIST:\n" +
-			":set-ua [Agent]       - Set User-Agent\n" +
-			":add-header [K]: [V]  - Set Header\n" +
-			":rm-header [K]        - Remove Header\n" +
-			":set-delay [dur]      - Set Delay (e.g., 50ms)\n" +
-			":worker [int]         - Set Worker threads\n" +
-			":filter-size [bytes]  - Filter by Size\n" +
-			":rm-filter-size [s]   - Remove Size Filter\n" +
-			":filter-code [code]   - Add Status Match\n" +
-			":rm-filter-code [c]   - Remove Status Match\n" +
-			":add-ext [ext]        - Add Extension\n" +
-			":rm-ext [ext]         - Remove Extension\n" +
-			":set-mutate [on|off]  - Toggle Mutation\n" +
-			":wordlist [path]      - Hot-swap Wordlist\n" +
-			":run                  - Resume Scanning\n" +
-			":help                 - Show this menu"
-	default:
-		return fmt.Errorf("unknown command")
 	}
-	return nil
+	return errorStyle.Render(fmt.Sprintf("Unknown command: %s (type :help for list)", name))
+}
+
+// formatResult formats a result for display.
+func formatResult(r engine.Result) string {
+	methodStr := r.Method
+	if methodStr == "" {
+		methodStr = "GET"
+	}
+
+	statusColor := statusStyle
+	switch {
+	case r.StatusCode >= 200 && r.StatusCode < 300:
+		statusColor = lipgloss.NewStyle().Foreground(DraculaGreen)
+	case r.StatusCode >= 300 && r.StatusCode < 400:
+		statusColor = lipgloss.NewStyle().Foreground(DraculaCyan)
+	case r.StatusCode == 403:
+		statusColor = lipgloss.NewStyle().Foreground(DraculaOrange)
+	case r.StatusCode >= 400 && r.StatusCode < 500:
+		statusColor = lipgloss.NewStyle().Foreground(DraculaYellow)
+	case r.StatusCode >= 500:
+		statusColor = lipgloss.NewStyle().Foreground(DraculaRed)
+	}
+
+	extras := ""
+	if r.Redirect != "" {
+		extras += mutedStyle.Render(fmt.Sprintf(" -> %s", r.Redirect))
+	}
+	if val, ok := r.Headers["Server"]; ok {
+		extras += mutedStyle.Render(fmt.Sprintf(" [Server: %s]", val))
+	}
+	if val, ok := r.Headers["X-Powered-By"]; ok {
+		extras += mutedStyle.Render(fmt.Sprintf(" [X-Powered-By: %s]", val))
+	}
+	if r.ContentType != "" {
+		extras += mutedStyle.Render(fmt.Sprintf(" [%s]", r.ContentType))
+	}
+	if r.Duration > 0 {
+		extras += mutedStyle.Render(fmt.Sprintf(" [%s]", r.Duration.Round(time.Millisecond)))
+	}
+
+	return fmt.Sprintf("%s %s %s %s %s %s%s",
+		statusColor.Render(fmt.Sprintf("[%d]", r.StatusCode)),
+		pinkStyle.Render(methodStr),
+		highlightStyle.Render(r.Path),
+		mutedStyle.Render(fmt.Sprintf("(Size:%d", r.Size)),
+		mutedStyle.Render(fmt.Sprintf("W:%d L:%d)", r.Words, r.Lines)),
+		extras,
+		"",
+	)
 }
 
 func (m Model) View() string {
-	if m.Width == 0 || m.Height == 0 {
+	if m.quitting {
+		return "\n  " + mutedStyle.Render("DirFuzz finished. Goodbye!") + "\n"
+	}
+
+	if !m.ready {
 		return "Initializing..."
 	}
 
-	// --- Top Half: Telemetry (Viewport) ---
-	var topContent string
-	if m.CommandMode {
-		// Side-by-side view with separator
-		left := m.Viewport.View()
-		// Ensure separator style matches theme
-		sep := lipgloss.NewStyle().Foreground(draculaComment).Render(" │ ")
-		right := m.HelpViewport.View()
-		topContent = lipgloss.JoinHorizontal(lipgloss.Top, left, sep, right)
-	} else {
-		topContent = m.Viewport.View()
+	// Header
+	elapsed := time.Since(m.startTime).Round(time.Second)
+	total := atomic.LoadInt64(&m.Engine.TotalLines)
+	processed := atomic.LoadInt64(&m.Engine.ProcessedLines)
+	rps := atomic.LoadInt64(&m.Engine.CurrentRPS)
+	queueSize := m.Engine.QueueSize()
+	count200 := atomic.LoadInt64(&m.Engine.Count200)
+	count403 := atomic.LoadInt64(&m.Engine.Count403)
+	count404 := atomic.LoadInt64(&m.Engine.Count404)
+	count429 := atomic.LoadInt64(&m.Engine.Count429)
+	count500 := atomic.LoadInt64(&m.Engine.Count500)
+	connErr := atomic.LoadInt64(&m.Engine.CountConnErr)
+
+	m.Engine.Config.RLock()
+	paused := m.Engine.Config.IsPaused
+	workers := m.Engine.Config.MaxWorkers
+	delay := m.Engine.Config.Delay
+	m.Engine.Config.RUnlock()
+
+	progressPct := float64(0)
+	if total > 0 {
+		progressPct = float64(processed) / float64(total) * 100
 	}
 
-	var topBox string
-	if m.TopFocused {
-		topBox = activeBoxStyle.Width(m.Width - 2).Render(topContent) // Highlight focus
-	} else {
-		topBox = boxStyle.Width(m.Width - 2).Render(topContent)
+	// Build progress bar
+	barWidth := 30
+	if m.width > 60 {
+		barWidth = m.width / 4
+	}
+	filled := int(progressPct / 100 * float64(barWidth))
+	if filled > barWidth {
+		filled = barWidth
+	}
+	bar := statusStyle.Render(strings.Repeat("█", filled)) + mutedStyle.Render(strings.Repeat("░", barWidth-filled))
+
+	pauseStr := ""
+	if paused {
+		pauseStr = errorStyle.Render(" [PAUSED]")
 	}
 
-	// Measure the top box height immediately to calculate remaining space
-	topHeight := lipgloss.Height(topBox)
-	bottomHeight := m.Height - topHeight
+	header := fmt.Sprintf(
+		"%s %s%s\n"+
+			"  %s %s  %s  %s  %s  %s\n"+
+			"  Progress: %s %s  |  RPS: %s  |  Queue: %s\n"+
+			"  Workers: %s  Delay: %s  Elapsed: %s\n"+
+			"  %s\n",
+		titleStyle.Render(" 🦇 DirFuzz 2.0 "),
+		highlightStyle.Render(m.Engine.BaseURL()),
+		pauseStr,
+		statusStyle.Render(fmt.Sprintf("2xx:%d", count200)),
+		orangeStyle.Render(fmt.Sprintf("403:%d", count403)),
+		mutedStyle.Render(fmt.Sprintf("404:%d", count404)),
+		yellowStyle.Render(fmt.Sprintf("429:%d", count429)),
+		errorStyle.Render(fmt.Sprintf("5xx:%d", count500)),
+		errorStyle.Render(fmt.Sprintf("Err:%d", connErr)),
+		bar,
+		highlightStyle.Render(fmt.Sprintf("%.1f%%", progressPct)),
+		pinkStyle.Render(fmt.Sprintf("%d", rps)),
+		mutedStyle.Render(fmt.Sprintf("%d", queueSize)),
+		highlightStyle.Render(fmt.Sprintf("%d", workers)),
+		mutedStyle.Render(delay.String()),
+		mutedStyle.Render(elapsed.String()),
+		mutedStyle.Render(fmt.Sprintf("(%d/%d)", processed, total)),
+	)
 
-	// --- Bottom Half: Logs or Command Input ---
-	var bottomContent string
-	var bottomBox string
+	// Footer
+	var footer string
+	if m.commandMode {
+		cmdLine := cmdPromptStyle.Render(":") + m.textInput.View()
 
-	if m.CommandMode {
-		// Render Suggestions
-		var suggestionsView string
-		if len(m.Suggestions) > 0 {
-			var lines []string
-			for i, s := range m.Suggestions {
-				prefix := "  "
-				lineStyle := lipgloss.NewStyle().Foreground(draculaComment)
-
-				if i == m.SuggestionIndex {
-					prefix = "> "
-					lineStyle = lipgloss.NewStyle().Foreground(draculaPurple).Bold(true)
-				}
-
-				// Actually using simple string manipulation for layout
-				left := fmt.Sprintf("%-20s", s.Name)
-				right := s.Description
-
-				renderedContent := fmt.Sprintf("%s%s %s", prefix, lineStyle.Render(left), lipgloss.NewStyle().Foreground(draculaComment).Italic(true).Render(right))
-				lines = append(lines, renderedContent)
-			}
-			// Limit suggestions height
-			if len(lines) > 10 {
-				lines = lines[:10]
-			}
-			suggestionsView = strings.Join(lines, "\n") + "\n\n"
-		}
-
-		bottomContent = fmt.Sprintf(
-			"COMMAND MODE (TAB to autocomplete)\n\n%s%s",
-			suggestionsView,
-			m.TextInput.View(),
-		)
-		// Active box for command mode? Or distinct style
-		bottomBox = activeBoxStyle.
-			Width(m.Width - 2).
-			Height(bottomHeight - 2).
-			Render(bottomContent)
-
-	} else {
-		// Render Logs
-		// Calculate available lines for logs inside the bottom box
-		// The bottom box has a border, so we subtract 2 from the height.
-		logLinesAvailable := bottomHeight - 2
-		if logLinesAvailable < 1 {
-			logLinesAvailable = 1
-		}
-
-		// Total logs available
-		totalLogs := len(m.Logs)
-
-		// The index of the last log to show
-		endIndex := totalLogs - m.ScrollOffset
-		if endIndex > totalLogs {
-			endIndex = totalLogs
-		}
-
-		// The index of the first log to show
-		startIndex := endIndex - logLinesAvailable
-		if startIndex < 0 {
-			startIndex = 0
-		}
-
-		var viewLogs []string
-		for i := startIndex; i < endIndex; i++ {
-			if i >= len(m.Logs) {
-				break
-			}
-			res := m.Logs[i]
-
-			// Eagle Alert Handling
-			prefix := lipgloss.NewStyle().Foreground(draculaPink).Render("[+]")
-			changeInfo := ""
-
-			if res.IsEagleAlert {
-				prefix = lipgloss.NewStyle().Foreground(draculaRed).Bold(true).Blink(true).Render("[EAGLE]")
-				changeInfo = lipgloss.NewStyle().Foreground(draculaRed).Bold(true).Render(fmt.Sprintf(" (CHANGE: %d -> %d)", res.OldStatusCode, res.StatusCode))
-			} else if res.IsAutoFilter {
-				prefix = lipgloss.NewStyle().Foreground(draculaOrange).Bold(true).Render("[AUTO-FILTER]")
-				if val, ok := res.Headers["Msg"]; ok {
-					changeInfo = lipgloss.NewStyle().Foreground(draculaOrange).Render(" " + val)
+		// Show suggestions
+		if len(m.suggestions) > 0 {
+			var sugLines []string
+			for i, s := range m.suggestions {
+				if i == m.selectedSugIdx {
+					sugLines = append(sugLines, statusStyle.Render("> "+s))
+				} else {
+					sugLines = append(sugLines, mutedStyle.Render("  "+s))
 				}
 			}
-
-			// Format Status Code
-			var statusStr string
-			if res.StatusCode >= 200 && res.StatusCode < 300 {
-				statusStr = status200.Render(fmt.Sprintf("%d", res.StatusCode))
-			} else if res.StatusCode >= 300 && res.StatusCode < 400 {
-				statusStr = status300.Render(fmt.Sprintf("%d", res.StatusCode))
-			} else if res.StatusCode >= 400 && res.StatusCode < 500 {
-				statusStr = status400.Render(fmt.Sprintf("%d", res.StatusCode))
-			} else {
-				statusStr = status500.Render(fmt.Sprintf("%d", res.StatusCode))
-			}
-
-			// Format Line
-			extras := ""
-			if val, ok := res.Headers["Server"]; ok {
-				extras += lipgloss.NewStyle().Foreground(draculaCyan).Render(fmt.Sprintf(" [Srv:%s]", val))
-			}
-			if val, ok := res.Headers["X-Powered-By"]; ok {
-				extras += lipgloss.NewStyle().Foreground(draculaCyan).Render(fmt.Sprintf(" [XPB:%s]", val))
-			}
-
-			methodStr := res.Method
-			if methodStr == "" {
-				methodStr = "HEAD"
-			}
-			methodFmt := lipgloss.NewStyle().Foreground(draculaPurple).Render(fmt.Sprintf("[%s]", methodStr))
-
-			redirectFmt := ""
-			if res.Redirect != "" {
-				redirectFmt = lipgloss.NewStyle().Foreground(draculaYellow).Render(fmt.Sprintf(" -> %s", res.Redirect))
-			}
-
-			line := fmt.Sprintf("%s %s %s%s %s %s%s %s%s",
-				prefix,
-				methodFmt,
-				pathStyle.Render(res.Path),
-				redirectFmt,
-				lipgloss.NewStyle().Foreground(draculaComment).Render("(Status:"),
-				statusStr,
-				changeInfo,
-				lipgloss.NewStyle().Foreground(draculaComment).Render(fmt.Sprintf(", Size: %s)", sizeStyle.Render(fmt.Sprintf("%d", res.Size)))),
-				extras,
-			)
-			viewLogs = append(viewLogs, line)
+			cmdLine += "\n" + strings.Join(sugLines, "\n")
 		}
 
-		// Fill empty space if not enough logs
-		for len(viewLogs) < logLinesAvailable {
-			viewLogs = append(viewLogs, "") // or blank lines
-		}
-
-		logView := strings.Join(viewLogs, "\n")
-
-		scrollMsg := ""
-		if m.ScrollOffset > 0 {
-			scrollMsg = lipgloss.NewStyle().Background(draculaRed).Bold(true).Render(fmt.Sprintf(" SCROLLED UP %d ", m.ScrollOffset))
-		}
-		bottomContent = fmt.Sprintf("LOGS: %s\n%s", scrollMsg, logView)
-
-		// Render Bottom Box
-		if !m.TopFocused && !m.CommandMode {
-			bottomBox = activeBoxStyle.Width(m.Width - 2).Height(bottomHeight - 2).Render(bottomContent)
-		} else {
-			bottomBox = boxStyle.Width(m.Width - 2).Height(bottomHeight - 2).Render(bottomContent)
-		}
+		footer = cmdLine
+	} else {
+		footer = mutedStyle.Render("  Press ':' for commands | 'p' to pause | '?' for help | 'q' to quit")
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, topBox, bottomBox)
-}
-
-func (m *Model) updateTelemetry() {
-	if m.Width == 0 || m.Height == 0 {
-		return
-	}
-	content := m.renderTelemetryContent()
-
-	newHeight := lipgloss.Height(content)
-	maxTopHeight := int(float64(m.Height) * 0.75)
-	if newHeight > maxTopHeight {
-		newHeight = maxTopHeight
-	}
-	if newHeight < 10 {
-		newHeight = 10
-	}
-
-	m.Viewport.Height = newHeight
-	y := m.Viewport.YOffset
-	m.Viewport.SetContent(content)
-	m.Viewport.YOffset = y
+	// Compose
+	return header + "\n" + m.viewport.View() + "\n" + footer
 }
