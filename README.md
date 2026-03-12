@@ -27,6 +27,9 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 - **Differential Analysis (Eagle Mode)**: Compare current scan results with a previous JSONL output to highlight changes.
 - **Proxy Support**: SOCKS5 proxy rotation from file.
 - **Response Metadata**: Captures Content-Type, response time (duration), word count, and line count per result.
+- **Response Time Filtering**: Filter results by response time with `-rt-min` and `-rt-max` flags (e.g., only show slow responses over 500ms).
+- **Proxy-Out (Burp Replay)**: Forward discovered hits through an HTTP proxy (e.g., Burp Suite) with `--proxy-out` for manual inspection and replay.
+- **Scope-Aware Recursion**: Recursive scanning only follows redirects that stay within the target domain, preventing off-scope crawling.
 - **HEAD→GET Caching**: Automatically detects HEAD rejection (405/501) and caches it to skip HEAD for all subsequent requests.
 - **Headless Mode**: Run without TUI using `-no-tui` for scripting and CI/CD pipelines.
 
@@ -110,6 +113,26 @@ dirfuzz -h
 ./dirfuzz -u http://example.com -w wordlist.txt -follow
 ```
 
+### Response Time Filtering
+
+```bash
+# Only show responses slower than 500ms (interesting blind injection candidates)
+./dirfuzz -u http://example.com -w wordlist.txt -rt-min 500ms
+
+# Only show responses faster than 2s (filter out timeouts)
+./dirfuzz -u http://example.com -w wordlist.txt -rt-max 2s
+
+# Combine both for a window
+./dirfuzz -u http://example.com -w wordlist.txt -rt-min 200ms -rt-max 5s
+```
+
+### Proxy-Out (Burp Replay)
+
+```bash
+# Forward all hits through Burp Suite for manual inspection
+./dirfuzz -u http://example.com -w wordlist.txt --proxy-out http://127.0.0.1:8080
+```
+
 ### POST Fuzzing with Body
 
 ```bash
@@ -168,6 +191,9 @@ dirfuzz -h
 | `-ac` | Auto-calibrate to detect wildcard responses | `false` |
 | `-resume` | Resume from a previous scan state file | |
 | `-urls` | File containing target URLs (one per line) | |
+| `-rt-min` | Filter responses faster than this duration (e.g. `500ms`, `1s`) | |
+| `-rt-max` | Filter responses slower than this duration (e.g. `5s`, `10s`) | |
+| `--proxy-out` | Replay hits through HTTP proxy (e.g. `http://127.0.0.1:8080` for Burp) | |
 
 ## Interactive TUI Controls
 
@@ -211,6 +237,9 @@ Press `:` to enter command mode. Commands support Tab autocomplete and Up/Down h
 | `:fl` | `:fl 10` | Filter by line count (-1 to disable). |
 | `:follow` | `:follow` | Toggle redirect following. |
 | `:body` | `:body {"key":"value"}` | Set request body for POST/PUT. |
+| `:rtmin` | `:rtmin 500ms` | Set min response time filter (0 = off). |
+| `:rtmax` | `:rtmax 5s` | Set max response time filter (0 = off). |
+| `:proxyout` | `:proxyout http://127.0.0.1:8080` | Set proxy-out for Burp replay (empty = off). |
 | `:clear` | `:clear` | Clear log output. |
 
 ## Auto-Filtering
@@ -268,7 +297,249 @@ worker 10, set-delay 166ms, see more here [Go to Command Mode](#command-mode)
 - **Resume support** (`-resume`): Save and resume scan progress.
 - **Content-Type tracking**: Captured and displayed for each result.
 - **Response time tracking**: Millisecond-precision duration captured and displayed.
+- **Response time filtering** (`-rt-min`, `-rt-max`): Filter results by response duration — useful for blind injection detection or filtering timeouts.
+- **Proxy-out** (`--proxy-out`): Forward all discovered hits through an HTTP proxy (e.g., Burp Suite at `http://127.0.0.1:8080`) for manual replay and inspection.
+- **Scope-aware recursion**: Recursive scanning now checks that redirect targets stay within the original domain before queuing them, preventing off-scope crawling.
 - **Live RPS counter**: Real-time requests-per-second displayed in TUI header.
+
+## Bug Bounty Playbook
+
+Real-world strategies for using DirFuzz during bug bounty engagements. These aren't hypotheticals — they're workflows that produce results.
+
+---
+
+### 1. Recon Phase: First Touch on a New Target
+
+Start quiet. You don't know the target yet — how it responds to 404s, whether it rate-limits, what stack it runs. Your first scan is about **learning the target's behavior**, not finding bugs.
+
+```bash
+dirfuzz -u https://target.com -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt -t 20 -ac
+```
+
+**Why this works:**
+- `-t 20` — Start low. You're profiling, not hammering. You can scale up from the TUI later with `:threads 50`.
+- `-ac` — Auto-calibrate catches wildcard responses immediately. If the target returns a custom 404 page with a `200 OK`, you'll know in seconds instead of drowning in false positives.
+
+Once the scan is running, watch the TUI. If you see a wall of identical response sizes, drop into command mode and add a size filter live:
+```
+:filter 4523
+```
+
+No restart needed. The scan keeps running and the noise disappears.
+
+---
+
+### 2. Hunting Backup Files and Exposed Source Code
+
+Developers leave things behind. `.bak`, `.old`, `.swp`, `~` files sitting in production. One forgotten `config.php.bak` can give you database credentials.
+
+```bash
+dirfuzz -u https://target.com -w /usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt -e php,asp,aspx,jsp,js,py,rb,conf,config,yml,yaml,json,xml,sql,log,txt,env,bak,old -mutate -r -depth 2
+```
+
+**Why this works:**
+- `-e` with a fat extension list hits every common web stack.
+- `-mutate` takes every file the wordlist finds and automatically generates `.bak`, `.old`, `.save`, `.swp`, `~` variants. If the wordlist has `config.php`, mutation will also try `config.php.bak`, `config.php.old`, `config.php~`, etc.
+- `-r -depth 2` — Recursive mode. When DirFuzz finds a directory (301/302), it queues it for deeper scanning automatically. Scope-aware recursion ensures you don't wander off-domain.
+
+**Pro tip:** If you find a `.git` directory or `web.config`, that single finding can cascade into source code disclosure. Pair this with a targeted wordlist for `.git/` enumeration on a second pass.
+
+---
+
+### 3. API Endpoint Discovery with Method Fuzzing
+
+Modern apps hide functionality behind REST APIs. A path might return 404 on GET but 200 on POST. Most fuzzers only send GET — you're leaving bugs on the table.
+
+```bash
+dirfuzz -u https://api.target.com -w /usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt -m GET,POST,PUT,DELETE,PATCH -smart-api -mc 200,201,204,301,302,401,403,405,500
+```
+
+**Why this works:**
+- `-m GET,POST,PUT,DELETE,PATCH` — Tests every common HTTP method against each path.
+- `-smart-api` — Doesn't waste time sending DELETE to `/images/logo.png`. It only applies multi-method testing to paths that look like API endpoints (`/api/`, `/v1/`, `/graphql`, paths without file extensions).
+- `-mc` includes `405` — A `405 Method Not Allowed` confirms the endpoint **exists** but rejects that method. That's recon gold. It tells you which methods the endpoint *does* accept.
+
+**During the scan**, if you spot an interesting 401 or 403, try adding an auth header live:
+```
+:header Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
+```
+
+---
+
+### 4. Blind Injection Detection via Response Timing
+
+This is where `-rt-min` becomes a weapon. If you're injecting payloads that cause server-side delays (SQL sleep, SSRF to internal hosts, template injection), the response time tells you if it worked.
+
+```bash
+dirfuzz -u "https://target.com/search?q={PAYLOAD}" -w sqli-payloads.txt -t 5 -rt-min 3s -delay 500
+```
+
+**Why this works:**
+- `{PAYLOAD}` injection — The payload goes directly into the query parameter, not appended as a path.
+- `-rt-min 3s` — Only show responses that took 3+ seconds. If your payload list contains `' OR SLEEP(5)--`, a 5-second response will light up while everything else is silently filtered.
+- `-t 5 -delay 500` — Low and slow. You're doing injection testing, not directory brute-forcing. Be surgical.
+
+**This also works for SSRF detection:**
+```bash
+dirfuzz -u "https://target.com/proxy?url={PAYLOAD}" -w ssrf-urls.txt -t 3 -rt-min 2s
+```
+
+If an internal URL causes a noticeable delay compared to external ones, you've found an SSRF.
+
+---
+
+### 5. Piping Everything to Burp with Proxy-Out
+
+You found hits. Now you need to **replay, modify, and exploit** them. Instead of manually copying URLs into Burp, let DirFuzz do it automatically.
+
+```bash
+dirfuzz -u https://target.com -w wordlist.txt -r -mutate --proxy-out http://127.0.0.1:8080
+```
+
+Every hit DirFuzz finds gets replayed through Burp's proxy. Open Burp's HTTP History tab and you'll see every discovered endpoint ready for manual testing — with the exact method, headers, and path that triggered the hit.
+
+**Workflow:**
+1. Run DirFuzz with `--proxy-out` pointed at Burp.
+2. Let it scan. Every 200, 301, 403 — all hits land in Burp's history.
+3. After the scan, sort Burp's history by status code or response size.
+4. Right-click interesting endpoints → Send to Repeater → Start manual testing.
+
+You can also enable this mid-scan from the TUI:
+```
+:proxyout http://127.0.0.1:8080
+```
+
+---
+
+### 6. Eagle Mode: Catch What Changed
+
+Bug bounty targets push code constantly. Endpoints appear and disappear. What was a 404 last week might be a 200 today — new feature, new attack surface.
+
+```bash
+# First scan — establish baseline
+dirfuzz -u https://target.com -w wordlist.txt -r -o baseline.jsonl
+
+# Later — run the exact same scan and compare
+dirfuzz -u https://target.com -w wordlist.txt -r -eagle baseline.jsonl
+```
+
+**Why this works:**
+- Eagle Mode loads your previous scan and compares every result. If a path changed status code (was 404, now 200 — or was 200, now 403), it gets flagged as an `[EAGLE]` alert in the TUI.
+- New deployments, staging endpoints accidentally exposed, features behind feature flags that just went live — Eagle Mode catches all of it.
+
+**Pro tip:** Automate this. Run a baseline scan during recon, save the JSONL. Set up a cron job or script that re-scans weekly with `-eagle` and `-no-tui`, then grep the output for eagle alerts:
+```bash
+dirfuzz -u https://target.com -w wordlist.txt -r -eagle baseline.jsonl -no-tui 2>&1 | grep EAGLE
+```
+
+---
+
+### 7. Dealing with WAFs and Rate Limits
+
+You hit a target and immediately get 429s or your IP gets temporarily blocked. DirFuzz handles this, but you need to use the right approach.
+
+```bash
+dirfuzz -u https://target.com -w wordlist.txt -t 10 -delay 200 -proxy /path/to/socks5-proxies.txt -ua "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+```
+
+**Why this works:**
+- `-t 10 -delay 200` — Low threads, 200ms between requests. Flies under most rate limiters.
+- `-proxy` — SOCKS5 proxy rotation. Each request goes through a different proxy, distributing the load across IPs.
+- `-ua` with a real browser User-Agent — Some WAFs flag non-browser UAs immediately.
+
+If you start getting 429s mid-scan, DirFuzz's auto-throttle will kick in automatically — reducing threads by 50% and adding delay. You can also react manually:
+```
+:delay 500
+:threads 5
+```
+
+**Custom headers for WAF bypass:**
+```
+:header X-Forwarded-For: 127.0.0.1
+:header X-Original-URL: /admin
+:header X-Rewrite-URL: /admin
+```
+
+---
+
+### 8. 403 Bypass Discovery
+
+A `403 Forbidden` doesn't mean "nothing here." It means "something here, access denied." That's an invitation.
+
+```bash
+dirfuzz -u https://target.com -w wordlist.txt -mc 200,204,301,302,307,403,500 -r -mutate -e php,html,jsp
+```
+
+When you find 403 paths, switch your approach. Use `{PAYLOAD}` to fuzz path variations that might bypass access controls:
+
+```bash
+# Create a file with 403 bypass patterns
+# ..;/admin
+# admin..
+# /./admin
+# admin%20
+# admin%09
+# %2fadmin
+# admin/./
+# .admin
+
+dirfuzz -u "https://target.com/{PAYLOAD}" -w 403-bypass-payloads.txt -t 10 -mc 200,301,302
+```
+
+If any bypass returns 200 instead of 403, you just found a broken access control vulnerability — that's a high/critical finding on most programs.
+
+---
+
+### 9. Multi-Target Hunting at Scale
+
+You have 50 subdomains from your recon. Scanning them one by one wastes time.
+
+```bash
+# subfinder + httpx to get live targets
+subfinder -d target.com -silent | httpx -silent -o live-targets.txt
+
+# Scan all of them
+dirfuzz -urls live-targets.txt -w wordlist.txt -t 30 -r -mutate -ac -no-tui -of url -o all-findings.txt
+```
+
+**Why this works:**
+- `-urls` — Feed the entire list. DirFuzz scans each target sequentially.
+- `-ac` — Auto-calibrate runs per target, so each one gets its own wildcard detection.
+- `-no-tui -of url` — Headless mode, outputs just the discovered URLs. Perfect for piping into other tools.
+- After the scan, feed `all-findings.txt` into nuclei, Burp, or your manual testing workflow.
+
+---
+
+### 10. Live Tuning: The TUI Advantage
+
+The biggest edge DirFuzz has is the ability to **change everything mid-scan**. Most fuzzers are fire-and-forget. DirFuzz lets you react to what you're seeing in real time.
+
+**Real scenario:** You start a scan and notice a pattern:
+1. You see twenty responses with size `4523` — that's the custom 404 page. Type `:filter 4523`.
+2. The noise clears. Now you see a few `403` responses for `/admin`, `/api`, `/internal`. Interesting.
+3. You want to focus on those paths recursively. The scan is already running, so just let DirFuzz's recursive mode handle it.
+4. You spot a `301` redirect to a subdomain. Because scope-aware recursion is on, DirFuzz only follows it if it stays in-domain.
+5. You want deeper inspection — enable Burp proxy live: `:proxyout http://127.0.0.1:8080`.
+6. Want to check if there are slow responses suggesting server-side processing? `:rtmin 1s`.
+7. Swap to a bigger wordlist without restarting: `:wordlist /path/to/large-wordlist.txt`.
+
+This is how you hunt. Not by running 10 tools — by running one tool that adapts with you.
+
+---
+
+### Quick Reference: High-Value Flag Combos
+
+| Scenario | Command |
+|----------|---------|
+| First recon on new target | `dirfuzz -u URL -w raft-medium-directories.txt -t 20 -ac` |
+| Backup file hunting | `dirfuzz -u URL -w raft-medium-files.txt -e php,asp,js,conf,env -mutate -r` |
+| API endpoint discovery | `dirfuzz -u URL -w api-endpoints.txt -m GET,POST,PUT,DELETE -smart-api` |
+| Blind injection timing | `dirfuzz -u "URL?param={PAYLOAD}" -w payloads.txt -t 5 -rt-min 3s` |
+| All hits to Burp | `dirfuzz -u URL -w wordlist.txt --proxy-out http://127.0.0.1:8080` |
+| Diff scan (what changed?) | `dirfuzz -u URL -w wordlist.txt -eagle previous-scan.jsonl` |
+| WAF-aware slow scan | `dirfuzz -u URL -w wordlist.txt -t 10 -delay 200 -proxy proxies.txt` |
+| Mass subdomain scan | `dirfuzz -urls targets.txt -w wordlist.txt -ac -no-tui -of url` |
+| Full aggressive (authorized) | `dirfuzz -u URL -w big.txt -t 100 -r -depth 3 -mutate -e php,asp,aspx,jsp,js,py,conf,env,bak,old -m GET,POST,PUT,DELETE -smart-api --proxy-out http://127.0.0.1:8080` |
 
 ## Note
 

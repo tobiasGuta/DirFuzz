@@ -287,6 +287,9 @@ func (m *Model) initCommands() {
 			followRedir := m.Engine.Config.FollowRedirects
 			body := m.Engine.Config.RequestBody
 			outputFmt := m.Engine.Config.OutputFormat
+			filterDurMin := m.Engine.Config.FilterRTMin
+			filterDurMax := m.Engine.Config.FilterRTMax
+			proxyOut := m.Engine.Config.ProxyOut
 			m.Engine.Config.RUnlock()
 
 			var sb strings.Builder
@@ -312,6 +315,15 @@ func (m *Model) initCommands() {
 			}
 			if filterLines >= 0 {
 				sb.WriteString(fmt.Sprintf("  FilterLines: %d\n", filterLines))
+			}
+			if filterDurMin > 0 {
+				sb.WriteString(fmt.Sprintf("  RTmin:      %s\n", filterDurMin))
+			}
+			if filterDurMax > 0 {
+				sb.WriteString(fmt.Sprintf("  RTmax:      %s\n", filterDurMax))
+			}
+			if proxyOut != "" {
+				sb.WriteString(fmt.Sprintf("  ProxyOut:   %s\n", proxyOut))
 			}
 			if body != "" {
 				sb.WriteString(fmt.Sprintf("  Body:       %s\n", body))
@@ -382,6 +394,52 @@ func (m *Model) initCommands() {
 				return statusStyle.Render("[*] Request body cleared")
 			}
 			return statusStyle.Render("[*] Request body set")
+		}},
+		{Name: "rtmin", Description: "Set min response time filter (e.g. 500ms, 0 = off)", Args: "<duration>", Handler: func(m *Model, args string) string {
+			arg := strings.TrimSpace(args)
+			if arg == "" || arg == "0" || arg == "off" {
+				m.Engine.Config.Lock()
+				m.Engine.Config.FilterRTMin = 0
+				m.Engine.Config.Unlock()
+				return statusStyle.Render("[*] Min response time filter disabled")
+			}
+			d, err := time.ParseDuration(arg)
+			if err != nil {
+				return errorStyle.Render("Usage: :rtmin <duration> (e.g. 500ms, 1s)")
+			}
+			m.Engine.Config.Lock()
+			m.Engine.Config.FilterRTMin = d
+			m.Engine.Config.Unlock()
+			return statusStyle.Render(fmt.Sprintf("[*] Min response time filter: %s", d))
+		}},
+		{Name: "rtmax", Description: "Set max response time filter (e.g. 5s, 0 = off)", Args: "<duration>", Handler: func(m *Model, args string) string {
+			arg := strings.TrimSpace(args)
+			if arg == "" || arg == "0" || arg == "off" {
+				m.Engine.Config.Lock()
+				m.Engine.Config.FilterRTMax = 0
+				m.Engine.Config.Unlock()
+				return statusStyle.Render("[*] Max response time filter disabled")
+			}
+			d, err := time.ParseDuration(arg)
+			if err != nil {
+				return errorStyle.Render("Usage: :rtmax <duration> (e.g. 5s, 10s)")
+			}
+			m.Engine.Config.Lock()
+			m.Engine.Config.FilterRTMax = d
+			m.Engine.Config.Unlock()
+			return statusStyle.Render(fmt.Sprintf("[*] Max response time filter: %s", d))
+		}},
+		{Name: "proxyout", Description: "Set proxy-out for Burp replay (empty = off)", Args: "<url>", Handler: func(m *Model, args string) string {
+			addr := strings.TrimSpace(args)
+			m.Engine.Config.Lock()
+			m.Engine.Config.ProxyOut = addr
+			if addr == "" || addr == "off" {
+				m.Engine.Config.ProxyOut = ""
+				m.Engine.Config.Unlock()
+				return statusStyle.Render("[*] Proxy-out disabled")
+			}
+			m.Engine.Config.Unlock()
+			return statusStyle.Render(fmt.Sprintf("[*] Proxy-out: %s", addr))
 		}},
 		{Name: "clear", Description: "Clear log output", Args: "", Handler: func(m *Model, args string) string {
 			m.logs = []string{}

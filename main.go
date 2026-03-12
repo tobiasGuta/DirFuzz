@@ -67,6 +67,13 @@ func main() {
 	outputFormat := flag.String("of", "jsonl", "Output format: jsonl, csv, url")
 	noTUI := flag.Bool("no-tui", false, "Disable TUI, print results to stdout")
 
+	// Response time filtering
+	rtMin := flag.String("rt-min", "", "Filter responses faster than this duration (e.g. 500ms, 1s)")
+	rtMax := flag.String("rt-max", "", "Filter responses slower than this duration (e.g. 5s, 10s)")
+
+	// Proxy-out (replay hits through external proxy)
+	proxyOut := flag.String("proxy-out", "", "Replay hits through HTTP proxy (e.g. http://127.0.0.1:8080 for Burp)")
+
 	// Auto-calibrate
 	autoCalibrate := flag.Bool("ac", false, "Auto-calibrate to detect wildcard responses")
 
@@ -151,6 +158,25 @@ func main() {
 		}
 	}
 
+	// Parse response time filters
+	var rtMinDur, rtMaxDur time.Duration
+	if *rtMin != "" {
+		d, err := time.ParseDuration(*rtMin)
+		if err != nil {
+			fmt.Printf("Invalid -rt-min duration: %s\n", *rtMin)
+			os.Exit(1)
+		}
+		rtMinDur = d
+	}
+	if *rtMax != "" {
+		d, err := time.ParseDuration(*rtMax)
+		if err != nil {
+			fmt.Printf("Invalid -rt-max duration: %s\n", *rtMax)
+			os.Exit(1)
+		}
+		rtMaxDur = d
+	}
+
 	// Parse methods
 	var methodList []string
 	if *methods != "" {
@@ -171,7 +197,8 @@ func main() {
 			exts, methodList, *smartAPI, *requestBody, *mutate, *recursive, *maxDepth,
 			*proxyFile, *eagleScan, *outputFile, *outputFormat, *noTUI,
 			*autoCalibrate, *matchRegex, *filterRegex, *filterWords, *filterLines,
-			*matchWords, *matchLines, *followRedirects, *maxRedirects, *resumeFile)
+			*matchWords, *matchLines, *followRedirects, *maxRedirects, *resumeFile,
+			rtMinDur, rtMaxDur, *proxyOut)
 	}
 }
 
@@ -180,7 +207,8 @@ func runScan(target, wordlist string, threads, delayMs int, userAgent string,
 	requestBody string, mutate, recursive bool, maxDepth int,
 	proxyFile, eagleScan, outputFile, outputFormat string, noTUI, autoCalibrate bool,
 	matchRegex, filterRegex string, filterWords, filterLines, matchWords, matchLines int,
-	followRedirects bool, maxRedirects int, resumeFile string) {
+	followRedirects bool, maxRedirects int, resumeFile string,
+	rtMin, rtMax time.Duration, proxyOut string) {
 
 	// Init engine
 	eng := engine.NewEngine(threads, 10_000_000, 0.001)
@@ -211,6 +239,9 @@ func runScan(target, wordlist string, threads, delayMs int, userAgent string,
 	eng.Config.MatchWords = matchWords
 	eng.Config.MatchLines = matchLines
 	eng.Config.OutputFormat = outputFormat
+	eng.Config.FilterRTMin = rtMin
+	eng.Config.FilterRTMax = rtMax
+	eng.Config.ProxyOut = proxyOut
 	eng.Config.Unlock()
 
 	// Match/Filter regex

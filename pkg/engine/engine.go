@@ -3,10 +3,13 @@ package engine
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -54,8 +57,13 @@ type Config struct {
 	FilterLines int // -1 means disabled
 	MatchWords  int // -1 means disabled
 	MatchLines  int // -1 means disabled
+	// Response time filtering
+	FilterRTMin time.Duration // 0 means disabled
+	FilterRTMax time.Duration // 0 means disabled
 	// Output format
 	OutputFormat string // "jsonl", "csv", "url"
+	// Proxy-out for Burp replay
+	ProxyOut string
 }
 
 // Job represents a single scan task.
@@ -132,6 +140,9 @@ type Engine struct {
 	// Compiled regexes (cached)
 	matchRe  *regexp.Regexp
 	filterRe *regexp.Regexp
+
+	// Scope domain for recursion
+	scopeDomain string
 }
 
 // Result holds the details of a successful fuzzing hit.
@@ -755,6 +766,9 @@ func (e *Engine) SetTarget(targetURL string) error {
 	e.targetLock.Lock()
 	e.baseURL = targetURL
 	e.host = u.Host
+	if e.scopeDomain == "" {
+		e.scopeDomain = u.Hostname()
+	}
 	e.targetLock.Unlock()
 	return nil
 }
@@ -1056,6 +1070,9 @@ func (e *Engine) worker(id int) {
 		filterLines := e.Config.FilterLines
 		matchWords := e.Config.MatchWords
 		matchLines := e.Config.MatchLines
+		filterRTMin := e.Config.FilterRTMin
+		filterRTMax := e.Config.FilterRTMax
+		proxyOut := e.Config.ProxyOut
 		e.Config.RUnlock()
 
 		shouldExit := id >= maxWorkers
@@ -1291,6 +1308,22 @@ func (e *Engine) worker(id int) {
 			continue
 		}
 
+		// 5. Response time filtering
+		if filterRTMin > 0 && resp.Duration < filterRTMin {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+		if filterRTMax > 0 && resp.Duration > filterRTMax {
+			e.activeJobs.Done()
+			if shouldExit {
+				return
+			}
+			continue
+		}
+
 		// Smart Filter Logic
 		if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 403 {
 			fpKey := fmt.Sprintf("%d:%d", resp.StatusCode, bodySize)
@@ -1375,6 +1408,11 @@ func (e *Engine) worker(id int) {
 
 		e.Results <- result
 
+		// Proxy-out replay: forward hit through external proxy (e.g. Burp)
+		if proxyOut != "" {
+			go e.replayThroughProxy(proxyOut, fullURL, successfulMethod, ua, headers, requestBody, payload)
+		}
+
 		// Smart Mutation
 		if resp.StatusCode == 200 || resp.StatusCode == 403 || resp.StatusCode == 301 {
 			e.Config.RLock()
@@ -1399,7 +1437,20 @@ func (e *Engine) worker(id int) {
 		e.Config.RUnlock()
 
 		if doRecurse && depth < maxDepth {
-			if !e.checkRecursiveWildcard(payload) {
+			// Scope-aware: only recurse into paths on the same domain
+			inScope := true
+			if result.Redirect != "" {
+				if parsedRedir, err := url.Parse(result.Redirect); err == nil && parsedRedir.Host != "" {
+					e.targetLock.RLock()
+					scopeDom := e.scopeDomain
+					e.targetLock.RUnlock()
+					redirHost := parsedRedir.Hostname()
+					if redirHost != scopeDom && !strings.HasSuffix(redirHost, "."+scopeDom) {
+						inScope = false
+					}
+				}
+			}
+			if inScope && !e.checkRecursiveWildcard(payload) {
 				e.AddScanner()
 				go func(runID int64, basePath string, nextDepth int, wlPath string) {
 					defer e.scannerWg.Done()
@@ -1452,6 +1503,47 @@ func (e *Engine) worker(id int) {
 			return
 		}
 	}
+}
+
+// replayThroughProxy forwards a hit through an HTTP proxy (e.g. Burp Suite) for manual inspection.
+func (e *Engine) replayThroughProxy(proxyAddr, fullURL, method, ua string, headers map[string]string, requestBody, payload string) {
+	proxyURL, err := url.Parse(proxyAddr)
+	if err != nil {
+		return
+	}
+
+	transport := &http.Transport{
+		Proxy:           http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second,
+	}
+
+	if method == "" || method == "HEAD" {
+		method = "GET"
+	}
+
+	var body io.Reader
+	if requestBody != "" && (method == "POST" || method == "PUT" || method == "PATCH") {
+		body = strings.NewReader(strings.ReplaceAll(requestBody, "{PAYLOAD}", payload))
+	}
+
+	req, err := http.NewRequest(method, fullURL, body)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", ua)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
 }
 
 // Submit adds a payload to the queue if it passes the Bloom filter check.
