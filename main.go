@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dirfuzz/pkg/engine"
@@ -344,6 +345,7 @@ func runHeadless(eng *engine.Engine, outputFile, outputFormat string) {
 
 	go func() {
 		eng.Wait()
+		close(eng.Results)
 	}()
 
 	for result := range eng.Results {
@@ -387,23 +389,34 @@ func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
 		defer csvWriter.Flush()
 	}
 
-	// Writer goroutine: pull from a tapped channel
-	writeCh := make(chan engine.Result, 100)
+	// Create a new channel for the TUI to read from
+	tuiResults := make(chan engine.Result, 100)
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Intercept results from the engine
 	go func() {
-		for result := range writeCh {
-			if result.IsAutoFilter {
-				continue
-			}
-			switch outputFormat {
-			case "csv":
-				csvWriter.Write(result.ToCSV())
-			case "url":
-				if result.URL != "" {
-					fmt.Fprintln(outFile, result.URL)
+		defer wg.Done()
+		for r := range eng.Results {
+			// Write to file
+			if !r.IsAutoFilter {
+				switch outputFormat {
+				case "csv":
+					csvWriter.Write(r.ToCSV())
+				case "url":
+					if r.URL != "" {
+						fmt.Fprintln(outFile, r.URL)
+					}
+				default:
+					data, _ := json.Marshal(r)
+					outFile.Write(append(data, '\n'))
 				}
+			}
+			
+			// Forward to TUI non-blockingly so we don't hold up the writer
+			select {
+			case tuiResults <- r:
 			default:
-				data, _ := json.Marshal(result)
-				outFile.Write(append(data, '\n'))
 			}
 		}
 		if csvWriter != nil {
@@ -411,27 +424,9 @@ func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
 		}
 	}()
 
-	// Wrap engine Results channel to tap into the writer
-	origResults := eng.Results
-	tappedResults := make(chan engine.Result, cap(origResults))
-	eng.Results = tappedResults
-
-	go func() {
-		for r := range origResults {
-			writeCh <- r
-			tappedResults <- r
-		}
-		close(tappedResults)
-		close(writeCh)
-	}()
-
-	// Engine completion goroutine
-	go func() {
-		eng.Wait()
-	}()
-
-	// Start TUI
-	model := tui.NewModel(eng)
+	// Since we are no longer closing eng.Results natively (to survive restarts),
+	// we just let the TUI run until the user quits it.
+	model := tui.NewModel(eng, tuiResults)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("TUI error: %v\n", err)

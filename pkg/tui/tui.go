@@ -81,6 +81,7 @@ type TickMsg time.Time
 // Model is the BubbleTea model for the TUI.
 type Model struct {
 	Engine        *engine.Engine
+	resultsCh     <-chan engine.Result
 	viewport      viewport.Model
 	textInput     textinput.Model
 	logs          []string
@@ -107,7 +108,7 @@ type Model struct {
 }
 
 // NewModel initializes the TUI model.
-func NewModel(eng *engine.Engine) Model {
+func NewModel(eng *engine.Engine, resultsCh <-chan engine.Result) Model {
 	ti := textinput.New()
 	ti.Placeholder = "Type ':' to enter command mode, 'q' to quit"
 	ti.CharLimit = 256
@@ -118,6 +119,7 @@ func NewModel(eng *engine.Engine) Model {
 
 	m := Model{
 		Engine:    eng,
+		resultsCh: resultsCh,
 		viewport:  vp,
 		textInput: ti,
 		logs:      []string{},
@@ -466,7 +468,7 @@ type ResultMsg engine.Result
 // listenForResults returns a command that reads from the Results channel.
 func (m Model) listenForResults() tea.Cmd {
 	return func() tea.Msg {
-		result, ok := <-m.Engine.Results
+		result, ok := <-m.resultsCh
 		if !ok {
 			return nil
 		}
