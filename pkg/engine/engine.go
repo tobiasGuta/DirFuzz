@@ -25,45 +25,37 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// Config holds the dynamic settings for the engine.
+// Config holds all runtime configuration for the engine.
 type Config struct {
 	sync.RWMutex
-	UserAgent   string
-	Headers     map[string]string
-	MatchCodes  map[int]bool
-	FilterSizes map[int]bool
-	IsPaused    bool
-	Delay       time.Duration
-	MaxWorkers  int
-	// Recursive settings
-	Recursive    bool
-	MaxDepth     int
-	WordlistPath string
-	Extensions   []string
-	Mutate       bool
-	// Smart API Method Fuzzer
-	Methods    []string
-	SmartAPI   bool
-	OutputFile string
-	// Request body for POST/PUT fuzzing
-	RequestBody string
-	// Follow redirects
+	UserAgent       string
+	Headers         map[string]string
+	MatchCodes      map[int]bool
+	FilterSizes     map[int]bool
+	MatchRegex      string
+	FilterRegex     string
+	Extensions      []string
+	Methods         []string
+	SmartAPI        bool
+	Mutate          bool
+	Recursive       bool
+	MaxDepth        int
+	IsPaused        bool
+	Delay           time.Duration
+	MaxWorkers      int
 	FollowRedirects bool
 	MaxRedirects    int
-	// Body matching/filtering
-	MatchRegex  string
-	FilterRegex string
-	FilterWords int // -1 means disabled
-	FilterLines int // -1 means disabled
-	MatchWords  int // -1 means disabled
-	MatchLines  int // -1 means disabled
-	// Response time filtering
-	FilterRTMin time.Duration // 0 means disabled
-	FilterRTMax time.Duration // 0 means disabled
-	// Output format
-	OutputFormat string // "jsonl", "csv", "url"
-	// Proxy-out for Burp replay
-	ProxyOut string
+	RequestBody     string
+	FilterWords     int
+	FilterLines     int
+	MatchWords      int
+	MatchLines      int
+	OutputFormat    string
+	FilterRTMin     time.Duration
+	FilterRTMax     time.Duration
+	ProxyOut        string
+	WordlistPath    string
+	OutputFile      string
 }
 
 // Job represents a single scan task.
@@ -1145,8 +1137,10 @@ func (e *Engine) worker(id int) {
 		var successfulMethod string
 
 		if job.Method == "" {
-			// Check HEAD rejection cache
-			if atomic.LoadInt32(&e.headRejected) == 1 {
+			// If any body-based filtering is active, we must use GET to have a body to inspect.
+			bodyFilterActive := e.matchRe != nil || e.filterRe != nil || filterWords >= 0 || filterLines >= 0 || matchWords >= 0 || matchLines >= 0
+
+			if bodyFilterActive || atomic.LoadInt32(&e.headRejected) == 1 {
 				// Skip HEAD, go straight to GET
 				successfulMethod = "GET"
 				rawGET := []byte(fmt.Sprintf(
