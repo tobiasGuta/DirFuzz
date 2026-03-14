@@ -1563,13 +1563,12 @@ func (e *Engine) Submit(job Job) {
 	e.jobs <- job
 }
 
-// Wait closes the jobs channel and waits for all workers to finish processing.
+// Wait waits for all scanners and jobs to finish.
+// Note: We no longer close(e.jobs) or close(e.Results) here to allow
+// the :restart command to safely reuse the channels without panicking.
 func (e *Engine) Wait() {
 	e.scannerWg.Wait()
 	e.activeJobs.Wait()
-	close(e.jobs)
-	e.wg.Wait()
-	close(e.Results)
 }
 
 // WriteResultCSV writes a CSV header to the given writer.

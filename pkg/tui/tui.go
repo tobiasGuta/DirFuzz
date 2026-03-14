@@ -3,6 +3,7 @@ package tui
 import (
 	"dirfuzz/pkg/engine"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -581,6 +582,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cmdHistoryIdx > 0 {
 					m.cmdHistoryIdx--
 					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
+					m.textInput.SetCursor(len(m.textInput.Value()))
 				}
 				return m, nil
 			}
@@ -597,14 +599,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cmdHistoryIdx < len(m.cmdHistory)-1 {
 					m.cmdHistoryIdx++
 					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
+					m.textInput.SetCursor(len(m.textInput.Value()))
 				}
 				return m, nil
 			}
 
 		case "tab":
 			if m.commandMode && len(m.suggestions) > 0 {
-				m.textInput.SetValue(m.suggestions[m.selectedSugIdx] + " ")
-				m.suggestions = nil
+				val := m.textInput.Value()
+				if strings.HasPrefix(val, "wordlist ") {
+					// Append the completion instead of replacing the whole string
+					base := val
+					lastSlash := strings.LastIndex(val, "/")
+					if lastSlash != -1 {
+						base = val[:lastSlash+1]
+					} else {
+						base = "wordlist "
+					}
+					
+					suggestion := m.suggestions[m.selectedSugIdx]
+					if strings.HasSuffix(suggestion, "/") {
+						newVal := base + suggestion
+						m.textInput.SetValue(newVal)
+						m.textInput.SetCursor(len(newVal))
+						// Trigger new completion
+						m.updateSuggestions(newVal)
+					} else {
+						newVal := base + suggestion + " "
+						m.textInput.SetValue(newVal)
+						m.textInput.SetCursor(len(newVal))
+						m.suggestions = nil
+					}
+				} else {
+					newVal := m.suggestions[m.selectedSugIdx] + " "
+					m.textInput.SetValue(newVal)
+					m.textInput.SetCursor(len(newVal))
+					m.suggestions = nil
+				}
 				return m, nil
 			}
 		}
@@ -616,17 +647,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Autocomplete
 			val := m.textInput.Value()
-			if val != "" {
-				m.suggestions = nil
-				for _, c := range m.commands {
-					if strings.HasPrefix(c.Name, val) {
-						m.suggestions = append(m.suggestions, c.Name)
-					}
-				}
-				m.selectedSugIdx = 0
-			} else {
-				m.suggestions = nil
-			}
+			m.updateSuggestions(val)
+
 			return m, tea.Batch(cmds...)
 		}
 
@@ -656,6 +678,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+func (m *Model) updateSuggestions(val string) {
+	m.suggestions = nil
+	if val == "" {
+		return
+	}
+
+	if strings.HasPrefix(val, "wordlist ") {
+		path := strings.TrimPrefix(val, "wordlist ")
+		dir := "."
+		base := path
+
+		lastSlash := strings.LastIndex(path, "/")
+		if lastSlash != -1 {
+			dir = path[:lastSlash]
+			base = path[lastSlash+1:]
+			if dir == "" {
+				dir = "/"
+			}
+		}
+
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, entry := range entries {
+				name := entry.Name()
+				if strings.HasPrefix(name, base) {
+					if entry.IsDir() {
+						m.suggestions = append(m.suggestions, name+"/")
+					} else {
+						m.suggestions = append(m.suggestions, name)
+					}
+				}
+			}
+		}
+		m.selectedSugIdx = 0
+		return
+	}
+
+	for _, c := range m.commands {
+		if strings.HasPrefix(c.Name, val) {
+			m.suggestions = append(m.suggestions, c.Name)
+		}
+	}
+	m.selectedSugIdx = 0
 }
 
 func (m *Model) appendLog(text string) {

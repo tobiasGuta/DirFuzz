@@ -3,3 +3,4 @@ scans/
 *.log
 *.jsonl
 .DS_Store
+.idea/
