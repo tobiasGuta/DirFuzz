@@ -569,6 +569,17 @@ end
 2. **Use string.find() over patterns** - Simple substring matching is faster
 3. **Return early** - Check the most likely conditions first
 4. **Test standalone** - Test your Lua logic in a Lua interpreter before using with DirFuzz
+5. **Benchmark your plugin** - At 50 threads, a plugin adding 1ms per call costs ~50ms of 
+   aggregate throughput per second. Profile the real impact by comparing RPS with and without 
+   your plugin using `-no-tui`:
+```bash
+   # Baseline RPS
+   dirfuzz -u http://example.com -w wordlist.txt -no-tui
+
+   # Plugin RPS
+   dirfuzz -u http://example.com -w wordlist.txt -plugin-match matcher.lua -no-tui
+```
+   If RPS drops significantly, simplify your plugin logic.
 
 ## Changes in v2.0
 
