@@ -780,6 +780,9 @@ func (e *Engine) SetTarget(targetURL string) error {
 	if err != nil {
 		return err
 	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid URL: missing scheme or host")
+	}
 	e.targetLock.Lock()
 	e.baseURL = targetURL
 	e.host = u.Host
@@ -992,6 +995,7 @@ func (e *Engine) autoThrottleCheck() {
 func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, targetURL, reqHost, ua string, headers map[string]string, maxRedirects int, proxyAddr string) (*httpclient.RawResponse, string) {
 	resp := initialResp
 	finalURL := ""
+	currentURL := targetURL
 
 	for i := 0; i < maxRedirects; i++ {
 		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
@@ -1002,16 +1006,11 @@ func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, target
 			break
 		}
 
-		// Resolve relative URLs
-		if strings.HasPrefix(location, "/") {
-			parsed, _ := url.Parse(targetURL)
-			if parsed != nil {
-				location = parsed.Scheme + "://" + parsed.Host + location
-			}
-		} else if !strings.HasPrefix(location, "http") {
-			parsed, _ := url.Parse(targetURL)
-			if parsed != nil {
-				location = parsed.Scheme + "://" + parsed.Host + "/" + location
+		baseURL, err := url.Parse(currentURL)
+		if err == nil {
+			locURL, err := url.Parse(location)
+			if err == nil {
+				location = baseURL.ResolveReference(locURL).String()
 			}
 		}
 
@@ -1044,6 +1043,7 @@ func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, target
 		}
 		resp = nextResp
 		finalURL = location
+		currentURL = location
 	}
 
 	return resp, finalURL
@@ -1418,7 +1418,7 @@ func (e *Engine) worker(id int) {
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 && !followRedirects {
 			result.Redirect = resp.GetHeader("Location")
 		}
-		if finalRedirectURL != "" {
+		if finalRedirectURL != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			result.Redirect = finalRedirectURL
 		}
 
