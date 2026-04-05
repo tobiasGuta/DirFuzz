@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"sync"
 	"net/url"
 	"strconv"
 	"strings"
@@ -48,6 +49,48 @@ func (r *RawResponse) GetHeader(key string) string {
 
 // SendRawRequest sends a completely raw HTTP request over TCP or TLS.
 // It randomizes TLS cipher suites to help bypass basic fingerprinting.
+
+type dnsCacheEntry struct {
+	ip  string
+	exp time.Time
+}
+
+var (
+	dnsCache sync.Map
+	dnsTTL   = 60 * time.Second
+)
+
+func resolveHost(ctx context.Context, host string) (string, error) {
+	// If it's already an IP, just return it
+	if ip := net.ParseIP(host); ip != nil {
+		return host, nil
+	}
+
+	if val, ok := dnsCache.Load(host); ok {
+		entry := val.(dnsCacheEntry)
+		if time.Now().Before(entry.exp) {
+			return entry.ip, nil
+		}
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	if err != nil {
+		return "", err
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no IPs found for %s", host)
+	}
+
+	// simple round robin could be implemented, but returning first works well
+	ipStr := ips[0].String()
+	dnsCache.Store(host, dnsCacheEntry{
+		ip:  ipStr,
+		exp: time.Now().Add(dnsTTL),
+	})
+
+	return ipStr, nil
+}
+
 func SendRawRequest(targetURL string, rawRequest []byte, timeout time.Duration, proxyAddr string) (*RawResponse, error) {
 	return SendRawRequestWithContext(context.Background(), targetURL, rawRequest, timeout, proxyAddr, false)
 }

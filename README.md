@@ -896,3 +896,14 @@ However:
 -   You can adapt it to your own workflows or research needs.
 
 If you build something interesting on top of it, feel free to reference the project.
+## What's New in Version 2.0 (Recent Updates)
+
+* **Per-Host Rate Limiting**: The global queue rate limits (`-delay`, RPS) are now cleanly tracked independently at a per-host scope. This prevents slower proxy/multi-target scans on one URL from artificially starving different targets in your scan.
+* **Transient Connection Retry Logic (`-retry`)**: HTTP dial connections are now protected by exponential backoff logic configurable via the `-retry X` flag—this guarantees random TCP network spikes on flaky hosts don't lead to blindly skipped payloads.  
+* **Expanded `{PAYLOAD}` Injection**: The `{PAYLOAD}` parameter injection tag mapping is directly supported natively inside `-ua "User-Agent"`, header mappings (`-h`), and `Cookie` values, scaling fuzzing dynamically into any protocol layer requirement. 
+* **Multi-Wordlist Native Parsing**: The `--wordlist` (`-w`) flag now functionally parses direct comma-separated arrays (e.g. `-w api.txt,common.txt`) rendering multi-layer iterations consecutively. 
+* **Thread-Safe DNS Resolution Caching**: The HTTP client manages local `sync.Map` IP caching with a 60s TTL over custom dials mapping directly back to native IP structs to bypass extremely expensive and repetitive localized OS DNS/socket queries during massive proxy bypass operations.
+* **Safe OS Signal Interruption**: Intercepts `SIGINT` (Ctrl+C) and `SIGTERM` signals directly into the processing engine—halting tasks safely, flushing the `bufio.Writer`/`csvWriter` instantly, and closing files gracefully preventing partially written corrupted outputs or lost JSON/CSV states. 
+* **Configurable File Mutations (`-me`)**: Dynamic parameter controlling file extension overrides (defaults: `-me ".bak,.old,.save,~,.swp"`). 
+* **Internal Magic Numbers Removed**: Dynamic channel queue depths corresponding linearly natively to `-threads` (`DefaultWorkerCount * 10`) handling saturation cleanly.
+

@@ -28,36 +28,38 @@ import (
 // Config holds all runtime configuration for the engine.
 type Config struct {
 	sync.RWMutex
-	UserAgent       string
-	Headers         map[string]string
-	MatchCodes      map[int]bool
-	FilterSizes     map[int]bool
-	MatchRegex      string
-	FilterRegex     string
-	Extensions      []string
-	Methods         []string
-	SmartAPI        bool
-	Mutate          bool
-	Recursive       bool
-	MaxDepth        int
-	IsPaused        bool
-	Delay           time.Duration
-	MaxWorkers      int
-	FollowRedirects bool
-	MaxRedirects    int
-	RequestBody     string
-	FilterWords     int
-	FilterLines     int
-	MatchWords      int
-	MatchLines      int
-	OutputFormat    string
-	FilterRTMin     time.Duration
-	FilterRTMax     time.Duration
-	ProxyOut        string
-	WordlistPath    string
-	OutputFile      string
-	Timeout         time.Duration
-	Insecure        bool
+	UserAgent           string
+	Headers             map[string]string
+	MatchCodes          map[int]bool
+	FilterSizes         map[int]bool
+	MatchRegex          string
+	FilterRegex         string
+	Extensions          []string
+	Methods             []string
+	SmartAPI            bool
+	Mutate              bool
+	Recursive           bool
+	MaxDepth            int
+	IsPaused            bool
+	Delay               time.Duration
+	MaxWorkers          int
+	FollowRedirects     bool
+	MaxRedirects        int
+	RequestBody         string
+	FilterWords         int
+	FilterLines         int
+	MatchWords          int
+	MatchLines          int
+	OutputFormat        string
+	FilterRTMin         time.Duration
+	FilterRTMax         time.Duration
+	ProxyOut            string
+	WordlistPath        string
+	OutputFile          string
+	Timeout             time.Duration
+	Insecure            bool
+	AutoFilterThreshold int
+	MaxRetries          int
 }
 
 // Job represents a single scan task.
@@ -94,8 +96,11 @@ type Engine struct {
 	proxyIndex  uint64
 	proxyDialer bool
 
-	// Rate Limiter
-	limiter *rate.Limiter
+	// Rate Limiters (Per-Host)
+	limiters     map[string]*rate.Limiter
+	limitersLock sync.RWMutex
+	currentLimit rate.Limit
+	currentBurst int
 
 	// Progress tracking
 	TotalLines     int64
@@ -219,10 +224,12 @@ func NewEngine(numWorkers int, expectedItems uint, falsePositiveRate float64) *E
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
-		jobs:       make(chan Job, DefaultJobQueueSize),
-		filter:     bloom.NewWithEstimates(expectedItems, falsePositiveRate),
-		numWorkers: numWorkers,
-		limiter:    rate.NewLimiter(rate.Inf, burst),
+		jobs:         make(chan Job, DefaultJobQueueSize),
+		filter:       bloom.NewWithEstimates(expectedItems, falsePositiveRate),
+		numWorkers:   numWorkers,
+		limiters:     make(map[string]*rate.Limiter),
+		currentLimit: rate.Inf,
+		currentBurst: burst,
 		Config: &Config{
 			UserAgent:    "DirFuzz/2.0",
 			Headers:      make(map[string]string),
@@ -307,11 +314,19 @@ func (e *Engine) LoadPreviousScan(path string) error {
 
 // SetRPS updates the rate limiter settings dynamically.
 func (e *Engine) SetRPS(rps int) {
+	var limit rate.Limit
 	if rps <= 0 {
-		e.limiter.SetLimit(rate.Inf)
+		limit = rate.Inf
 	} else {
-		e.limiter.SetLimit(rate.Limit(rps))
+		limit = rate.Limit(rps)
 	}
+
+	e.limitersLock.Lock()
+	e.currentLimit = limit
+	for _, l := range e.limiters {
+		l.SetLimit(limit)
+	}
+	e.limitersLock.Unlock()
 }
 
 // UpdateRateLimiterFromDelay updates the rate limiter based on the delay setting.
@@ -321,22 +336,59 @@ func (e *Engine) UpdateRateLimiterFromDelay() {
 	workers := e.Config.MaxWorkers
 	e.Config.RUnlock()
 
+	var limit rate.Limit
+	var b int
+
 	if d <= 0 {
-		e.limiter.SetLimit(rate.Inf)
-		burst := workers
-		if burst < 10 {
-			burst = 10
+		limit = rate.Inf
+		b = workers
+		if b < 10 {
+			b = 10
 		}
-		e.limiter.SetBurst(burst)
 	} else {
 		// Each worker sleeps `d` per request, so effective RPS = workers / d_seconds
 		rps := float64(workers) / d.Seconds()
 		if rps < 1 {
 			rps = 1
 		}
-		e.limiter.SetLimit(rate.Limit(rps))
-		e.limiter.SetBurst(workers)
+		limit = rate.Limit(rps)
+		b = workers
 	}
+
+	e.limitersLock.Lock()
+	e.currentLimit = limit
+	e.currentBurst = b
+	for _, l := range e.limiters {
+		l.SetLimit(limit)
+		l.SetBurst(b)
+	}
+	e.limitersLock.Unlock()
+}
+
+// getLimiter returns the rate limiter for a specific host, creating one if it doesn't exist.
+func (e *Engine) getLimiter(host string) *rate.Limiter {
+	e.limitersLock.RLock()
+	l, exists := e.limiters[host]
+	e.limitersLock.RUnlock()
+	if exists {
+		return l
+	}
+
+	e.limitersLock.Lock()
+	defer e.limitersLock.Unlock()
+
+	// Double-check after acquiring write lock
+	if l, exists := e.limiters[host]; exists {
+		return l
+	}
+
+	// Use current global limit and burst configs
+	limit := e.currentLimit
+	burst := e.currentBurst
+
+	newLimiter := rate.NewLimiter(limit, burst)
+	e.limiters[host] = newLimiter
+	return newLimiter
 }
 
 // ConfigureFilters sets the matching status codes and filtering sizes.
@@ -586,14 +638,14 @@ drainLoop:
 	atomic.AddInt64(&e.RunID, 1)
 
 	// Start new scanner
-	e.KickoffScanner(path)
+	e.KickoffScanner(path, 0)
 	return nil
 }
 
 // KickoffScanner starts the wordlist scanner safely attached to the current context generation.
-func (e *Engine) KickoffScanner(path string) {
+func (e *Engine) KickoffScanner(path string, startLine int64) {
 	e.AddScanner()
-	go e.StartWordlistScanner(e.scannerCtx, atomic.LoadInt64(&e.RunID), path)
+	go e.StartWordlistScanner(e.scannerCtx, atomic.LoadInt64(&e.RunID), path, startLine)
 }
 
 // AddScanner increments the scanner waitgroup.
@@ -602,7 +654,7 @@ func (e *Engine) AddScanner() {
 }
 
 // StartWordlistScanner reads from a Wordlist and submits payloads to the engine.
-func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path string) {
+func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path string, startLine int64) {
 	defer e.scannerWg.Done()
 	e.Config.Lock()
 	e.Config.WordlistPath = path
@@ -844,7 +896,7 @@ func (e *Engine) AutoCalibrate() error {
 			proxyAddr = e.GetNextProxy()
 		}
 
-		resp, err := httpclient.SendRawRequest(e.BaseURL(), rawRequest, CalibrationTimeout, proxyAddr)
+		resp, err := e.executeRequestWithRetry(e.scannerCtx, e.BaseURL(), rawRequest, CalibrationTimeout, proxyAddr)
 		if err != nil {
 			return fmt.Errorf("calibration request failed: %v", err)
 		}
@@ -902,7 +954,7 @@ func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
 	if e.proxyDialer {
 		proxyAddr = e.GetNextProxy()
 	}
-	resp, err := httpclient.SendRawRequest(e.BaseURL(), rawRequest, RecursiveWildcardTimeout, proxyAddr)
+	resp, err := e.executeRequestWithRetry(e.scannerCtx, e.BaseURL(), rawRequest, RecursiveWildcardTimeout, proxyAddr)
 	if err != nil {
 		return false
 	}
@@ -1037,7 +1089,7 @@ func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, target
 			reqPath, parsedLoc.Host, ua, headersStr.String(),
 		))
 
-		nextResp, err := httpclient.SendRawRequest(location, rawReq, DefaultHTTPTimeout, proxyAddr)
+		nextResp, err := e.executeRequestWithRetry(e.scannerCtx, location, rawReq, DefaultHTTPTimeout, proxyAddr)
 		if err != nil {
 			break
 		}
@@ -1056,6 +1108,40 @@ func (e *Engine) cleanupJob(shouldExit bool) bool {
 }
 
 // worker is the concurrent consumer that pulls from the jobs channel.
+
+// executeRequestWithRetry sends a raw HTTP request and retries on connection errors (err != nil) with exponential backoff.
+func (e *Engine) executeRequestWithRetry(ctx context.Context, targetURL string, rawRequest []byte, timeout time.Duration, proxyAddr string) (*httpclient.RawResponse, error) {
+	var resp *httpclient.RawResponse
+	var err error
+
+	e.Config.RLock()
+	retries := e.Config.MaxRetries
+	insecure := e.Config.Insecure
+	e.Config.RUnlock()
+
+	backoff := 1 * time.Second
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for attempt := 0; attempt <= retries; attempt++ {
+		resp, err = httpclient.SendRawRequestWithContext(ctx, targetURL, rawRequest, timeout, proxyAddr, insecure)
+		if err == nil {
+			return resp, nil
+		}
+
+		if attempt < retries {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+				backoff *= 2
+			}
+		}
+	}
+	return resp, err
+}
+
 func (e *Engine) worker(id int) {
 	defer e.wg.Done()
 
@@ -1107,14 +1193,6 @@ func (e *Engine) worker(id int) {
 			e.Config.RUnlock()
 		}
 
-		// Rate limiter wait
-		if err := e.limiter.Wait(context.Background()); err != nil {
-			if e.cleanupJob(shouldExit) {
-				return
-			}
-			continue
-		}
-
 		// Construct the full URL
 		var fullURL string
 		word := payload
@@ -1140,6 +1218,16 @@ func (e *Engine) worker(id int) {
 			continue
 		}
 
+		reqHost := parsedURL.Host
+
+		// Rate limiter wait (Per-Host)
+		if err := e.getLimiter(reqHost).Wait(context.Background()); err != nil {
+			if e.cleanupJob(shouldExit) {
+				return
+			}
+			continue
+		}
+
 		reqPath := parsedURL.Path
 		if parsedURL.RawQuery != "" {
 			reqPath += "?" + parsedURL.RawQuery
@@ -1147,12 +1235,14 @@ func (e *Engine) worker(id int) {
 		if reqPath == "" {
 			reqPath = "/"
 		}
-		reqHost := parsedURL.Host
+
+		// Inject payload into User-Agent
+		ua = strings.ReplaceAll(ua, "{PAYLOAD}", payload)
 
 		// Build headers string
 		var headersStr strings.Builder
 		for k, v := range headers {
-			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
+			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, strings.ReplaceAll(v, "{PAYLOAD}", payload)))
 		}
 
 		var proxyAddr string
@@ -1176,14 +1266,14 @@ func (e *Engine) worker(id int) {
 					"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
 					reqPath, reqHost, ua, headersStr.String(),
 				))
-				resp, err = httpclient.SendRawRequest(currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
+				resp, err = e.executeRequestWithRetry(e.scannerCtx, currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
 			} else {
 				successfulMethod = "HEAD"
 				rawRequest = []byte(fmt.Sprintf(
 					"HEAD %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
 					reqPath, reqHost, ua, headersStr.String(),
 				))
-				resp, err = httpclient.SendRawRequest(currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
+				resp, err = e.executeRequestWithRetry(e.scannerCtx, currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
 
 				if err == nil && (resp.StatusCode == 405 || resp.StatusCode == 501) {
 					// Cache: this host rejects HEAD
@@ -1193,7 +1283,7 @@ func (e *Engine) worker(id int) {
 						"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
 						reqPath, reqHost, ua, headersStr.String(),
 					))
-					respFB, errFB := httpclient.SendRawRequest(currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
+					respFB, errFB := e.executeRequestWithRetry(e.scannerCtx, currentBaseURL, rawRequest, DefaultHTTPTimeout, proxyAddr)
 					if errFB == nil {
 						resp = respFB
 					} else {
@@ -1217,7 +1307,7 @@ func (e *Engine) worker(id int) {
 				job.Method, reqPath, reqHost, ua, headersStr.String(), bodyContent,
 			))
 
-			resp, err = httpclient.SendRawRequest(currentBaseURL, rawRequest, 5*time.Second, proxyAddr)
+			resp, err = e.executeRequestWithRetry(e.scannerCtx, currentBaseURL, rawRequest, 5*time.Second, proxyAddr)
 			atomic.AddInt64(&e.ProcessedLines, 1)
 		}
 
@@ -1358,7 +1448,7 @@ func (e *Engine) worker(id int) {
 			count := e.fpCounts[fpKey]
 			e.fpMutex.Unlock()
 
-			if count == AutoFilterThreshold {
+			if count == e.Config.AutoFilterThreshold {
 				e.AddFilterSize(bodySize)
 				e.Results <- Result{
 					Path:         "AUTO-FILTER",
@@ -1369,7 +1459,7 @@ func (e *Engine) worker(id int) {
 					IsAutoFilter: true,
 				}
 			}
-			if count >= AutoFilterThreshold {
+			if count >= e.Config.AutoFilterThreshold {
 				if e.cleanupJob(shouldExit) {
 					return
 				}
@@ -1560,9 +1650,9 @@ func (e *Engine) replayThroughProxy(proxyAddr, fullURL, method, ua string, heade
 	if err != nil {
 		return
 	}
-	req.Header.Set("User-Agent", ua)
+	req.Header.Set("User-Agent", strings.ReplaceAll(ua, "{PAYLOAD}", payload))
 	for k, v := range headers {
-		req.Header.Set(k, v)
+		req.Header.Set(k, strings.ReplaceAll(v, "{PAYLOAD}", payload))
 	}
 
 	resp, err := client.Do(req)

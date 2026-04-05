@@ -2,23 +2,25 @@ package engine
 
 import (
 	"fmt"
+	"sync"
 
 	lua "github.com/yuin/gopher-lua"
 )
 
 // PluginMatcher wraps a Lua script that matches responses
 type PluginMatcher struct {
+	mu   sync.Mutex
 	vm   *lua.LState
 	file string
 }
 
 // PluginMutator wraps a Lua script that mutates payloads
 type PluginMutator struct {
+	mu   sync.Mutex
 	vm   *lua.LState
 	file string
 }
 
-// NewPluginMatcher creates a new Lua-based matcher
 func NewPluginMatcher(scriptPath string) (*PluginMatcher, error) {
 	L := lua.NewState()
 
@@ -39,12 +41,13 @@ func NewPluginMatcher(scriptPath string) (*PluginMatcher, error) {
 
 // Match executes the Lua match function
 func (pm *PluginMatcher) Match(statusCode, size, words, lines int, body, contentType string) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	matchFunc := pm.vm.GetGlobal("match")
 	if matchFunc == lua.LNil {
 		return false
 	}
-
-	// Create response table
 	respTable := pm.vm.NewTable()
 	pm.vm.SetField(respTable, "status_code", lua.LNumber(statusCode))
 	pm.vm.SetField(respTable, "size", lua.LNumber(size))
@@ -97,12 +100,13 @@ func NewPluginMutator(scriptPath string) (*PluginMutator, error) {
 
 // Mutate executes the Lua mutate function
 func (pm *PluginMutator) Mutate(original string) []string {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
 	mutateFunc := pm.vm.GetGlobal("mutate")
 	if mutateFunc == lua.LNil {
 		return []string{original}
 	}
-
-	// Call mutate function
 	if err := pm.vm.CallByParam(lua.P{
 		Fn:      mutateFunc,
 		NRet:    1,

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os/signal"
+	"syscall"
+
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -10,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dirfuzz/pkg/engine"
@@ -103,57 +107,64 @@ func isFlagSet(name string) bool {
 
 // ScanOptions holds all configuration for a scan run.
 type ScanOptions struct {
-	Target          string
-	Wordlist        string
-	Threads         int
-	DelayMs         int
-	UserAgent       string
-	Headers         map[string]string
-	MatchCodes      []int
-	FilterSizes     []int
-	Extensions      []string
-	Methods         []string
-	SmartAPI        bool
-	RequestBody     string
-	Mutate          bool
-	Recursive       bool
-	MaxDepth        int
-	ProxyFile       string
-	EagleScan       string
-	OutputFile      string
-	OutputFormat    string
-	NoTUI           bool
-	AutoCalibrate   bool
-	MatchRegex      string
-	FilterRegex     string
-	FilterWords     int
-	FilterLines     int
-	MatchWords      int
-	MatchLines      int
-	FollowRedirects bool
-	MaxRedirects    int
-	ResumeFile      string
-	RTMin           time.Duration
-	RTMax           time.Duration
-	ProxyOut        string
-	Timeout         time.Duration
-	ConnectTimeout  time.Duration
-	ReadTimeout     time.Duration
-	Insecure        bool
-	Cookies         string
-	UseHTTP2        bool
-	PluginMatch     string
-	PluginMutate    string
+	Target              string
+	Wordlist            string
+	Threads             int
+	DelayMs             int
+	UserAgent           string
+	Headers             map[string]string
+	MatchCodes          []int
+	FilterSizes         []int
+	Extensions          []string
+	Methods             []string
+	SmartAPI            bool
+	RequestBody         string
+	Mutate              bool
+	Mutations           []string
+	Recursive           bool
+	MaxDepth            int
+	ProxyFile           string
+	EagleScan           string
+	OutputFile          string
+	OutputFormat        string
+	NoTUI               bool
+	AutoCalibrate       bool
+	MatchRegex          string
+	FilterRegex         string
+	FilterWords         int
+	FilterLines         int
+	MatchWords          int
+	MatchLines          int
+	FollowRedirects     bool
+	MaxRedirects        int
+	ResumeFile          string
+	RTMin               time.Duration
+	RTMax               time.Duration
+	ProxyOut            string
+	Timeout             time.Duration
+	ConnectTimeout      time.Duration
+	ReadTimeout         time.Duration
+	Insecure            bool
+	Cookies             string
+	UseHTTP2            bool
+	PluginMatch         string
+	PluginMutate        string
+	AutoFilterThreshold int
+	MaxRetries          int
 }
 
 func main() {
+	// Version
+	version := flag.Bool("v", false, "Print DirFuzz version")
+
 	// Required
 	target := flag.String("u", "", "Target URL (use {PAYLOAD} for injection point)")
-	wordlist := flag.String("w", "", "Path to wordlist file")
+	wordlist := flag.String("w", "", "Path to wordlist file(s), comma-separated")
 
 	// Basic options
 	threads := flag.Int("t", 50, "Number of concurrent threads")
 	delay := flag.Int("delay", 0, "Delay between requests in ms (per-worker)")
+	retries := flag.Int("retry", 0, "Number of retries for failed transient network connections")
 	userAgent := flag.String("ua", "DirFuzz/2.0", "User-Agent string")
 	var parsedHeaders headerFlags
 	flag.Var(&parsedHeaders, "h", "Custom HTTP header (can be specified multiple times, e.g. -h 'Key: Value')")
@@ -161,6 +172,7 @@ func main() {
 	// Status code matching
 	matchCodesStr := flag.String("mc", "200,204,301,302,307,308,401,403,405,500", "Match HTTP status codes (comma-separated)")
 	filterSizesStr := flag.String("fs", "", "Filter response sizes (comma-separated)")
+	autoFilterThreshold := flag.Int("af", engine.DefaultAutoFilterThreshold, "Number of identical responses before auto-filtering (0 = off)")
 
 	// Body matching/filtering
 	matchRegex := flag.String("mr", "", "Match body regex pattern")
@@ -172,7 +184,8 @@ func main() {
 
 	// Extensions & mutation
 	extensions := flag.String("e", "", "Extensions to append (comma-separated, e.g. php,html,js)")
-	mutate := flag.Bool("mutate", false, "Enable smart mutation (.bak, .old, .save, etc.)")
+	mutate := flag.Bool("mutate", false, "Enable smart mutation")
+	mutationsStr := flag.String("me", engine.DefaultMutations, "Mutation extensions (comma-separated)")
 
 	// Recursive scanning
 	recursive := flag.Bool("r", false, "Enable recursive scanning")
@@ -260,6 +273,12 @@ func main() {
 		if !isFlagSet("fs") && viper.IsSet("filter_sizes") {
 			*filterSizesStr = viper.GetString("filter_sizes")
 		}
+		if !isFlagSet("af") && viper.IsSet("auto_filter_threshold") {
+			*autoFilterThreshold = viper.GetInt("auto_filter_threshold")
+		}
+		if !isFlagSet("me") && viper.IsSet("mutations") {
+			*mutationsStr = viper.GetString("mutations")
+		}
 		if !isFlagSet("e") && viper.IsSet("extensions") {
 			*extensions = viper.GetString("extensions")
 		}
@@ -278,6 +297,12 @@ func main() {
 		if !isFlagSet("b") && viper.IsSet("cookies") {
 			*cookies = viper.GetString("cookies")
 		}
+	}
+
+	// Print version and exit
+	if *version {
+		fmt.Println("🦇 DirFuzz v2.0")
+		os.Exit(0)
 	}
 
 	// Validate required args
@@ -340,6 +365,20 @@ func main() {
 		}
 	}
 
+	// Parse mutations
+	var mutationsList []string
+	if *mutationsStr != "" {
+		for _, m := range strings.Split(*mutationsStr, ",") {
+			m = strings.TrimSpace(m)
+			if m != "" {
+				if m != "~" && !strings.HasPrefix(m, ".") {
+					m = "." + m
+				}
+				mutationsList = append(mutationsList, m)
+			}
+		}
+	}
+
 	// Parse extensions
 	var exts []string
 	if *extensions != "" {
@@ -399,47 +438,50 @@ func main() {
 		}
 
 		opts := ScanOptions{
-			Target:          tgt,
-			Wordlist:        *wordlist,
-			Threads:         *threads,
-			DelayMs:         *delay,
-			UserAgent:       *userAgent,
-			Headers:         parsedHeaders,
-			MatchCodes:      matchCodes,
-			FilterSizes:     filterSizes,
-			Extensions:      exts,
-			Methods:         methodList,
-			SmartAPI:        *smartAPI,
-			RequestBody:     *requestBody,
-			Mutate:          *mutate,
-			Recursive:       *recursive,
-			MaxDepth:        *maxDepth,
-			ProxyFile:       *proxyFile,
-			EagleScan:       *eagleScan,
-			OutputFile:      *outputFile,
-			OutputFormat:    *outputFormat,
-			NoTUI:           *noTUI,
-			AutoCalibrate:   *autoCalibrate,
-			MatchRegex:      *matchRegex,
-			FilterRegex:     *filterRegex,
-			FilterWords:     *filterWords,
-			FilterLines:     *filterLines,
-			MatchWords:      *matchWords,
-			MatchLines:      *matchLines,
-			FollowRedirects: *followRedirects,
-			MaxRedirects:    *maxRedirects,
-			ResumeFile:      *resumeFile,
-			RTMin:           rtMinDur,
-			RTMax:           rtMaxDur,
-			ProxyOut:        *proxyOut,
-			Timeout:         timeoutVal,
-			ConnectTimeout:  connectTimeoutVal,
-			ReadTimeout:     readTimeoutVal,
-			Insecure:        *insecure,
-			Cookies:         *cookies,
-			UseHTTP2:        *useHTTP2,
-			PluginMatch:     *pluginMatch,
-			PluginMutate:    *pluginMutate,
+			Target:              tgt,
+			Wordlist:            *wordlist,
+			Threads:             *threads,
+			DelayMs:             *delay,
+			UserAgent:           *userAgent,
+			Headers:             parsedHeaders,
+			MatchCodes:          matchCodes,
+			FilterSizes:         filterSizes,
+			Extensions:          exts,
+			Mutations:           mutationsList,
+			Methods:             methodList,
+			SmartAPI:            *smartAPI,
+			RequestBody:         *requestBody,
+			Mutate:              *mutate,
+			Recursive:           *recursive,
+			MaxDepth:            *maxDepth,
+			ProxyFile:           *proxyFile,
+			EagleScan:           *eagleScan,
+			OutputFile:          *outputFile,
+			OutputFormat:        *outputFormat,
+			NoTUI:               *noTUI,
+			AutoCalibrate:       *autoCalibrate,
+			MatchRegex:          *matchRegex,
+			FilterRegex:         *filterRegex,
+			FilterWords:         *filterWords,
+			FilterLines:         *filterLines,
+			MatchWords:          *matchWords,
+			MatchLines:          *matchLines,
+			FollowRedirects:     *followRedirects,
+			MaxRedirects:        *maxRedirects,
+			ResumeFile:          *resumeFile,
+			RTMin:               rtMinDur,
+			RTMax:               rtMaxDur,
+			ProxyOut:            *proxyOut,
+			Timeout:             timeoutVal,
+			ConnectTimeout:      connectTimeoutVal,
+			ReadTimeout:         readTimeoutVal,
+			Insecure:            *insecure,
+			Cookies:             *cookies,
+			UseHTTP2:            *useHTTP2,
+			PluginMatch:         *pluginMatch,
+			PluginMutate:        *pluginMutate,
+			AutoFilterThreshold: *autoFilterThreshold,
+			MaxRetries:          *retries,
 		}
 
 		runScan(opts)
@@ -486,6 +528,8 @@ func runScan(opts ScanOptions) {
 	eng.Config.ProxyOut = opts.ProxyOut
 	eng.Config.Timeout = opts.Timeout
 	eng.Config.Insecure = opts.Insecure
+	eng.Config.AutoFilterThreshold = opts.AutoFilterThreshold
+	eng.Config.MaxRetries = opts.MaxRetries
 	eng.Config.Unlock()
 
 	// Match/Filter regex
@@ -522,10 +566,13 @@ func runScan(opts ScanOptions) {
 		fmt.Printf("[*] Loaded mutate plugin: %s\n", opts.PluginMutate)
 	}
 
+	var startLine int64
 	// Resume support
 	if opts.ResumeFile != "" {
 		eng.ResumeFile = opts.ResumeFile
-		wl, _, err := eng.LoadResumeState(opts.ResumeFile)
+		var err error
+		var wl string
+		wl, startLine, err = eng.LoadResumeState(opts.ResumeFile)
 		if err != nil {
 			fmt.Printf("Error loading resume file: %v\n", err)
 			return
@@ -588,7 +635,7 @@ func runScan(opts ScanOptions) {
 	eng.Start()
 
 	// Start wordlist scanner
-	eng.KickoffScanner(opts.Wordlist)
+	eng.KickoffScanner(opts.Wordlist, startLine)
 
 	if opts.NoTUI {
 		runHeadless(eng, outputFile, opts.OutputFormat)
@@ -599,74 +646,128 @@ func runScan(opts ScanOptions) {
 
 func runHeadless(eng *engine.Engine, outputFile, outputFormat string) {
 	var outFile *os.File
-	var err error
-
-	// Handle stdout vs file output
-	if outputFile == "-" {
-		outFile = os.Stdout
-	} else {
-		outFile, err = os.Create(outputFile)
-		if err != nil {
-			fmt.Printf("Error creating output file: %v\n", err)
-			return
-		}
-		defer outFile.Close()
-	}
-
 	var csvWriter *csv.Writer
-	if outputFormat == "csv" {
-		csvWriter = csv.NewWriter(outFile)
-		engine.WriteCSVHeader(csvWriter)
-		defer csvWriter.Flush()
+	var initialized bool
+	var hasResults bool
+
+	initOutput := func() error {
+		if initialized {
+			return nil
+		}
+		initialized = true
+		if outputFile == "-" {
+			outFile = os.Stdout
+		} else {
+			var err error
+			outFile, err = os.Create(outputFile)
+			if err != nil {
+				return err
+			}
+		}
+		if outputFormat == "csv" {
+			csvWriter = csv.NewWriter(outFile)
+			engine.WriteCSVHeader(csvWriter)
+		}
+		return nil
 	}
+
+	defer func() {
+		if outFile != nil && outputFile != "-" {
+			if csvWriter != nil {
+				csvWriter.Flush()
+			}
+			outFile.Close()
+		}
+	}()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		eng.Wait()
 		close(eng.Results)
 	}()
 
-	for result := range eng.Results {
-		if result.IsAutoFilter {
-			if msg, ok := result.Headers["Msg"]; ok {
-				fmt.Printf("[!] %s: %s\n", result.Path, msg)
+	for {
+		select {
+		case <-sigs:
+			fmt.Println("\n[!] Caught interrupt, saving output and exiting...")
+			if hasResults && outputFile != "-" {
+				fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
 			}
-			continue
-		}
-
-		fmt.Println(result.String())
-
-		switch outputFormat {
-		case "csv":
-			csvWriter.Write(result.ToCSV())
-		case "url":
-			if result.URL != "" {
-				fmt.Fprintln(outFile, result.URL)
+			return
+		case result, ok := <-eng.Results:
+			if !ok {
+				if hasResults && outputFile != "-" {
+					fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
+				}
+				return
 			}
-		default: // jsonl
-			data, _ := json.Marshal(result)
-			outFile.Write(append(data, '\n'))
-		}
-	}
 
-	if outputFile != "-" {
-		fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
+			if result.IsAutoFilter {
+				if msg, ok := result.Headers["Msg"]; ok {
+					fmt.Printf("[!] %s: %s\n", result.Path, msg)
+				}
+				continue
+			}
+
+			if err := initOutput(); err != nil {
+				fmt.Printf("Error creating output file: %v\n", err)
+				continue
+			}
+
+			hasResults = true
+			fmt.Println(result.String())
+
+			switch outputFormat {
+			case "csv":
+				csvWriter.Write(result.ToCSV())
+			case "url":
+				if result.URL != "" {
+					fmt.Fprintln(outFile, result.URL)
+				}
+			default: // jsonl
+				data, _ := json.Marshal(result)
+				outFile.Write(append(data, '\n'))
+			}
+		}
 	}
 }
-
 func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
-	outFile, err := os.Create(outputFile)
-	if err != nil {
-		fmt.Printf("Error creating output file: %v\n", err)
-		return
-	}
-	defer outFile.Close()
-
+	var outFile *os.File
 	var csvWriter *csv.Writer
-	if outputFormat == "csv" {
-		csvWriter = csv.NewWriter(outFile)
-		engine.WriteCSVHeader(csvWriter)
-		defer csvWriter.Flush()
+	initialized := false
+	var hasResults int32
+
+	initOutput := func() error {
+		if initialized {
+			return nil
+		}
+		initialized = true
+		var err error
+		if outputFile == "-" {
+			outFile = os.Stdout
+		} else {
+			outFile, err = os.Create(outputFile)
+			if err != nil {
+				return err
+			}
+		}
+		if outputFormat == "csv" {
+			csvWriter = csv.NewWriter(outFile)
+			engine.WriteCSVHeader(csvWriter)
+		}
+		return nil
 	}
+
+	defer func() {
+		if outFile != nil {
+			if csvWriter != nil {
+				csvWriter.Flush()
+			}
+			outFile.Close()
+		}
+	}()
 
 	// Create a new channel for the TUI to read from
 	tuiResults := make(chan engine.Result, 100)
@@ -677,18 +778,20 @@ func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
 	go func() {
 		defer wg.Done()
 		for r := range eng.Results {
-			// Write to file
 			if !r.IsAutoFilter {
-				switch outputFormat {
-				case "csv":
-					csvWriter.Write(r.ToCSV())
-				case "url":
-					if r.URL != "" {
-						fmt.Fprintln(outFile, r.URL)
+				if err := initOutput(); err == nil {
+					atomic.StoreInt32(&hasResults, 1)
+					switch outputFormat {
+					case "csv":
+						csvWriter.Write(r.ToCSV())
+					case "url":
+						if r.URL != "" {
+							fmt.Fprintln(outFile, r.URL)
+						}
+					default:
+						data, _ := json.Marshal(r)
+						outFile.Write(append(data, '\n'))
 					}
-				default:
-					data, _ := json.Marshal(r)
-					outFile.Write(append(data, '\n'))
 				}
 			}
 
@@ -703,13 +806,13 @@ func runWithTUI(eng *engine.Engine, outputFile, outputFormat string) {
 		}
 	}()
 
-	// Since we are no longer closing eng.Results natively (to survive restarts),
-	// we just let the TUI run until the user quits it.
 	model := tui.NewModel(eng, tuiResults)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("TUI error: %v\n", err)
 	}
 
-	fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
+	if atomic.LoadInt32(&hasResults) == 1 && outputFile != "-" {
+		fmt.Printf("\n[*] Results saved to: %s\n", outputFile)
+	}
 }

@@ -10,7 +10,7 @@ const (
 
 // Auto-Filter Thresholds
 const (
-	AutoFilterThreshold = 15 // Number of identical responses before auto-filtering
+	DefaultAutoFilterThreshold = 15 // Default number of identical responses before auto-filtering
 )
 
 // HTTP Client Configuration
@@ -24,7 +24,7 @@ const (
 // Worker Configuration
 const (
 	DefaultWorkerCount  = 50
-	DefaultJobQueueSize = 500 // jobs channel buffer = workers * 10
+	DefaultJobQueueSize = DefaultWorkerCount * 10 // jobs channel buffer = workers * 10
 	MinWorkerCount      = 1
 	MinRateLimitBurst   = 10
 )
@@ -32,7 +32,7 @@ const (
 // Calibration Settings
 const (
 	CalibrationRandomStringLen = 16
-	CalibrationTestCount       = 3
+	CalibrationTestCount       = 10
 	CalibrationTimeout         = 5 * time.Second
 )
 
@@ -56,5 +56,10 @@ const (
 // Output Settings
 const (
 	DefaultOutputFormat = "jsonl"
-	ResultsChannelSize  = 500 // results channel buffer = workers * 10
+	ResultsChannelSize  = DefaultWorkerCount * 10 // results channel buffer = workers * 10
+)
+
+// Mutation Settings
+const (
+	DefaultMutations = ".bak,.old,.save,~,.swp"
 )

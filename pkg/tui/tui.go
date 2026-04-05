@@ -1106,7 +1106,7 @@ func (m Model) View() string {
 			"  Progress: %s %s  |  RPS: %s  |  Queue: %s\n"+
 			"  Workers: %s  Delay: %s  Elapsed: %s\n"+
 			"  %s\n",
-		titleStyle.Render(" 🦇 DirFuzz 2.0 "),
+		titleStyle.Render(" 🦇 DirFuzz "),
 		highlightStyle.Render(m.Engine.BaseURL()),
 		pauseStr,
 		statusStyle.Render(fmt.Sprintf("2xx:%d", count200)),
