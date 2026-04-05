@@ -124,8 +124,10 @@ type Engine struct {
 	CurrentRPS    int64
 
 	// Smart Filter State
-	fpMutex  sync.RWMutex
-	fpCounts map[string]int
+	fpMutex           sync.RWMutex
+	fpCounts          map[string]int
+	manualFilterSizes map[int]bool
+	autoFilterSizes   map[int]bool
 
 	// Auto-throttle state
 	autoThrottle    bool
@@ -301,12 +303,14 @@ func NewEngine(numWorkers int, expectedItems uint, falsePositiveRate float64) *E
 			Timeout:      DefaultHTTPTimeout,
 			Insecure:     false,
 		},
-		scannerCtx:    ctx,
-		scannerCancel: cancel,
-		Results:       make(chan Result, ResultsChannelSize),
-		fpCounts:      make(map[string]int),
-		lastTick:      time.Now(),
-		autoThrottle:  true,
+		scannerCtx:        ctx,
+		scannerCancel:     cancel,
+		Results:           make(chan Result, ResultsChannelSize),
+		fpCounts:          make(map[string]int),
+		manualFilterSizes: make(map[int]bool),
+		autoFilterSizes:   make(map[int]bool),
+		lastTick:          time.Now(),
+		autoThrottle:      true,
 	}
 }
 
@@ -454,6 +458,7 @@ func (e *Engine) ConfigureFilters(mc []int, fs []int) {
 	}
 	for _, size := range fs {
 		e.Config.FilterSizes[size] = true
+		e.manualFilterSizes[size] = true
 	}
 }
 
@@ -560,6 +565,18 @@ func (e *Engine) AddFilterSize(size int) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
 	e.Config.FilterSizes[size] = true
+	e.manualFilterSizes[size] = true
+	delete(e.autoFilterSizes, size)
+}
+
+// AddAutoFilterSize adds a runtime auto-filter size (separate from user-defined filters).
+func (e *Engine) AddAutoFilterSize(size int) {
+	e.Config.Lock()
+	defer e.Config.Unlock()
+	e.Config.FilterSizes[size] = true
+	if !e.manualFilterSizes[size] {
+		e.autoFilterSizes[size] = true
+	}
 }
 
 // RemoveFilterSize removes a size from the blacklist safely.
@@ -567,6 +584,20 @@ func (e *Engine) RemoveFilterSize(size int) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
 	delete(e.Config.FilterSizes, size)
+	delete(e.manualFilterSizes, size)
+	delete(e.autoFilterSizes, size)
+}
+
+// clearAutoFilterSizes removes only runtime auto-filter sizes and keeps manual filters.
+func (e *Engine) clearAutoFilterSizes() {
+	e.Config.Lock()
+	defer e.Config.Unlock()
+	for size := range e.autoFilterSizes {
+		if !e.manualFilterSizes[size] {
+			delete(e.Config.FilterSizes, size)
+		}
+	}
+	e.autoFilterSizes = make(map[int]bool)
 }
 
 // AddMatchCode adds a status code to the allowlist safely.
@@ -672,6 +703,7 @@ func (e *Engine) ChangeWordlist(path string) error {
 	e.fpMutex.Lock()
 	e.fpCounts = make(map[string]int)
 	e.fpMutex.Unlock()
+	e.clearAutoFilterSizes()
 
 	// Drain pending jobs safely — use a counter to limit drain attempts
 drainLoop:
@@ -1526,7 +1558,7 @@ func (e *Engine) worker(id int) {
 			e.fpMutex.Unlock()
 
 			if count == e.Config.AutoFilterThreshold {
-				e.AddFilterSize(bodySize)
+				e.AddAutoFilterSize(bodySize)
 				e.Results <- Result{
 					Path:         "AUTO-FILTER",
 					Method:       successfulMethod,
