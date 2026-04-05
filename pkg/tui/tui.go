@@ -3,6 +3,7 @@ package tui
 import (
 	"dirfuzz/pkg/engine"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -136,7 +137,8 @@ type Model struct {
 	selectedSugIdx int
 
 	// State
-	quitting bool
+	quitting      bool
+	pendingTarget string
 }
 
 // NewModel initializes the TUI model.
@@ -308,29 +310,40 @@ func (m *Model) initCommands() {
 			if path == "" {
 				return errorStyle.Render("Usage: :wordlist <path>")
 			}
-			if err := m.Engine.ChangeWordlist(path); err != nil {
+			if _, err := os.Stat(path); err != nil {
 				return errorStyle.Render(fmt.Sprintf("Error: %v", err))
 			}
-			return statusStyle.Render(fmt.Sprintf("[*] Wordlist changed to: %s", path))
+			m.Engine.Config.Lock()
+			m.Engine.Config.WordlistPath = path
+			m.Engine.Config.Unlock()
+			return statusStyle.Render(fmt.Sprintf("[*] Wordlist queued: %s (run :restart to apply)", path))
 		}},
 		{Name: "changeurl", Description: "Change target URL", Args: "<url>", Handler: func(m *Model, args string) string {
-			url := strings.TrimSpace(args)
-			if url == "" {
+			targetURL := strings.TrimSpace(args)
+			if targetURL == "" {
 				return errorStyle.Render("Usage: :changeurl <url>")
 			}
-			if err := m.Engine.SetTarget(url); err != nil {
+			parsed, err := url.Parse(targetURL)
+			if err != nil {
 				return errorStyle.Render(fmt.Sprintf("Error: invalid target URL: %v", err))
 			}
-			// Restart is needed to apply the new URL to scanning jobs
-			if err := m.Engine.Restart(); err != nil {
-				return errorStyle.Render(fmt.Sprintf("URL updated, but restart failed: %v", err))
+			if parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+				return errorStyle.Render("Error: invalid target URL: must be http(s)://host")
 			}
-			return statusStyle.Render(fmt.Sprintf("[*] Target URL changed to: %s and scan restarted", url))
+			m.pendingTarget = targetURL
+			return statusStyle.Render(fmt.Sprintf("[*] Target URL queued: %s (run :restart to apply)", targetURL))
 		}},
 		{Name: "restart", Description: "Restart scan", Args: "", Handler: func(m *Model, args string) string {
+			if m.pendingTarget != "" {
+				if err := m.Engine.SetTarget(m.pendingTarget); err != nil {
+					return errorStyle.Render(fmt.Sprintf("Error applying pending target URL: %v", err))
+				}
+				m.pendingTarget = ""
+			}
 			if err := m.Engine.Restart(); err != nil {
 				return errorStyle.Render(fmt.Sprintf("Error: %v", err))
 			}
+			m.clearScanLogs()
 			return statusStyle.Render("[*] Scan restarted")
 		}},
 		{Name: "config", Description: "Show current config", Args: "", Handler: func(m *Model, args string) string {
@@ -400,7 +413,12 @@ func (m *Model) initCommands() {
 				return strings.Join(parts, ",")
 			}
 
-			target := m.Engine.BaseURL()
+			targetSwitch := m.Engine.BaseURL()
+			target := targetSwitch
+			if m.pendingTarget != "" {
+				targetSwitch = m.pendingTarget
+				target = m.pendingTarget + " (pending restart)"
+			}
 			wrapWidth := m.cmdViewport.Width - 6
 			if wrapWidth < 40 {
 				wrapWidth = 80
@@ -483,7 +501,7 @@ func (m *Model) initCommands() {
 
 			writeLine("")
 			writeLine("CLI switches (effective now):")
-			writeLine(fmt.Sprintf("  -u %s", target))
+			writeLine(fmt.Sprintf("  -u %s", targetSwitch))
 			if wordlist != "" {
 				writeLine(fmt.Sprintf("  -w %s", wordlist))
 			}
@@ -696,11 +714,7 @@ func (m *Model) initCommands() {
 			return statusStyle.Render(fmt.Sprintf("[*] Proxy-out: %s", addr))
 		}},
 		{Name: "clear", Description: "Clear log output", Args: "", Handler: func(m *Model, args string) string {
-			m.logs = []string{}
-			m.hits = []engine.Result{}
-			m.viewport.SetContent("")
-			m.selectedIndex = 0
-			m.listScrollIdx = 0
+			m.clearScanLogs()
 			return ""
 		}},
 		{Name: "clearcmd", Description: "Clear command panel output", Args: "", Handler: func(m *Model, args string) string {
@@ -1190,6 +1204,14 @@ func (m *Model) updateSuggestions(val string) {
 		}
 	}
 	m.selectedSugIdx = 0
+}
+
+func (m *Model) clearScanLogs() {
+	m.logs = []string{}
+	m.hits = []engine.Result{}
+	m.viewport.SetContent("")
+	m.selectedIndex = 0
+	m.listScrollIdx = 0
 }
 
 func (m *Model) appendLog(text string, hit *engine.Result) {
