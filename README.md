@@ -398,19 +398,7 @@ When the engine detects 429 (Too Many Requests) responses, it automatically:
 
 This helps maintain scanning effectiveness while respecting rate limits.
 
-<img width="1915" height="1025" alt="image" src="https://github.com/user-attachments/assets/94b4f5d1-fdcb-4a7c-acc4-590dbe62a916" />
-
-<img width="1912" height="1023" alt="image" src="https://github.com/user-attachments/assets/52363bda-551f-40cf-ad5c-ebda4e2245a5" />
-
-## Commands
-
-worker 10, set-delay 166ms, see more here [Go to Command Mode](#command-mode)
-
-<img width="1913" height="988" alt="image" src="https://github.com/user-attachments/assets/ffe6ce82-2f5f-48a3-9600-2066b6e0a5ae" />
-
-## Smart-api
-
-<img width="1919" height="1016" alt="Screenshot 2026-02-24 212226" src="https://github.com/user-attachments/assets/26765ee4-1a56-4132-936a-b43a3e031130" />
+https://github.com/user-attachments/assets/5aee6dc7-f669-44ba-b955-a7d5fbb75919
 
 ## Configuration Files
 
