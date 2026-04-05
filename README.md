@@ -16,6 +16,8 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 - **Smart Filtering**:
   - **Auto-Calibration**: Detects wildcard responses based on consistency.
   - **Auto-Filter**: Automatically identifies and blocks repetitive responses (e.g., custom 404 pages returning 200 OK) during the scan.
+    - **403 Classification**: Classifies `403` responses as `CF_WAF_BLOCK`, `CF_ADMIN_403`, `NGINX_403`, or `GENERIC_403` using body + header signals (case-insensitive).
+        - When `HEAD` returns `403`, DirFuzz performs a short `GET` follow-up for classification only, while keeping the general HEAD-first scan strategy.
   - **Word/Line Filtering**: Filter or match responses by exact word count (`-fw`, `-mw`) or line count (`-fl`, `-ml`).
   - **Body Regex**: Match (`-mr`) or filter (`-fr`) responses by regex patterns applied to the response body.
   - **Status Code Ranges**: Match status codes using ranges like `-mc 200-299,401-403,500`.
@@ -30,7 +32,7 @@ DirFuzz is a high-performance directory fuzzing tool written in Go, featuring a 
 - **Multi-Target Scanning**: Scan multiple targets from a file with `-urls`.
 - **Differential Analysis (Eagle Mode)**: Compare current scan results with a previous JSONL output to highlight changes.
 - **Proxy Support**: SOCKS5 proxy rotation from file with authentication support (`user:pass@host:port`).
-- **Response Metadata**: Captures Content-Type, response time (duration), word count, and line count per result.
+- **Response Metadata**: Captures Content-Type, response time (duration), word count, line count, and `forbidden_403_type` (for classified 403 responses) per result.
 - **Response Time Filtering**: Filter results by response time with `-rt-min` and `-rt-max` flags (e.g., only show slow responses over 500ms).
 - **Proxy-Out (Burp Replay)**: Forward discovered hits through an HTTP proxy (e.g., Burp Suite) with `--proxy-out` for manual inspection and replay.
 - **Scope-Aware Recursion**: Recursive scanning only follows redirects that stay within the target domain, preventing off-scope crawling.
@@ -382,7 +384,10 @@ Press `:` to enter command mode. Commands support Tab autocomplete and Up/Down h
 
 ## Auto-Filtering
 
-The engine includes an intelligent auto-filtering mechanism. If a specific status code and response size combination is detected repetitively (threshold: 15 occurrences), it is automatically added to the size filter to reduce noise. These events are logged as `[AUTO-FILTER]` alerts.
+The engine includes an intelligent auto-filtering mechanism. If a specific response fingerprint is detected repetitively (threshold: 15 occurrences), it is automatically added to the size filter to reduce noise. These events are logged as `[AUTO-FILTER]` alerts.
+
+- For most responses, the fingerprint is based on `status code + response size`.
+- For `403` responses, the fingerprint includes `forbidden_403_type + response size` so Cloudflare WAF blocks, Cloudflare admin 403s, nginx 403s, and generic 403s are not auto-filtered together.
 
 ## Auto-Throttle
 

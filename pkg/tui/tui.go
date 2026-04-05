@@ -66,6 +66,9 @@ var (
 			Foreground(DraculaPurple).
 			Bold(true)
 
+	separatorStyle = lipgloss.NewStyle().
+			Foreground(DraculaComment)
+
 	paneStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(DraculaPurple).
@@ -532,8 +535,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		headerHeight := 10
-		footerHeight := 3
+		headerHeight := 6 // 5 lines of content + 1 separator
+		footerHeight := 2 // 1 line of text + 1 separator
 		vpHeight := m.height - headerHeight - footerHeight
 		if vpHeight < 5 {
 			vpHeight = 5
@@ -983,6 +986,7 @@ func (m *Model) appendLog(text string, hit *engine.Result) {
 	}
 
 	m.renderListView()
+	m.viewport.GotoBottom()
 }
 
 // executeCommand parses and runs a TUI command.
@@ -1024,6 +1028,20 @@ func formatResult(r engine.Result) string {
 	}
 
 	extras := ""
+	if r.StatusCode == 403 && r.Forbidden403Type != "" {
+		forbidden403Style := mutedStyle
+		switch r.Forbidden403Type {
+		case "CF_WAF_BLOCK":
+			forbidden403Style = lipgloss.NewStyle().Foreground(DraculaRed)
+		case "CF_ADMIN_403":
+			forbidden403Style = lipgloss.NewStyle().Foreground(DraculaOrange)
+		case "NGINX_403":
+			forbidden403Style = lipgloss.NewStyle().Foreground(DraculaCyan)
+		case "GENERIC_403":
+			forbidden403Style = mutedStyle
+		}
+		extras += forbidden403Style.Render(fmt.Sprintf(" [%s]", r.Forbidden403Type))
+	}
 	if r.Redirect != "" {
 		extras += mutedStyle.Render(fmt.Sprintf(" -> %s", r.Redirect))
 	}
@@ -1100,21 +1118,29 @@ func (m Model) View() string {
 		pauseStr = errorStyle.Render(" [PAUSED]")
 	}
 
+	statsLine :=
+		statusStyle.Render(fmt.Sprintf("2xx:%d", count200)) +
+			mutedStyle.Render(" │ ") +
+			orangeStyle.Render(fmt.Sprintf("403:%d", count403)) +
+			mutedStyle.Render(" │ ") +
+			mutedStyle.Render(fmt.Sprintf("404:%d", count404)) +
+			mutedStyle.Render(" │ ") +
+			yellowStyle.Render(fmt.Sprintf("429:%d", count429)) +
+			mutedStyle.Render(" │ ") +
+			errorStyle.Render(fmt.Sprintf("5xx:%d", count500)) +
+			mutedStyle.Render(" │ ") +
+			errorStyle.Render(fmt.Sprintf("Err:%d", connErr))
+
 	header := fmt.Sprintf(
 		"%s %s%s\n"+
-			"  %s %s  %s  %s  %s  %s\n"+
+			"  %s\n"+
 			"  Progress: %s %s  |  RPS: %s  |  Queue: %s\n"+
 			"  Workers: %s  Delay: %s  Elapsed: %s\n"+
 			"  %s\n",
 		titleStyle.Render(" 🦇 DirFuzz "),
 		highlightStyle.Render(m.Engine.BaseURL()),
 		pauseStr,
-		statusStyle.Render(fmt.Sprintf("2xx:%d", count200)),
-		orangeStyle.Render(fmt.Sprintf("403:%d", count403)),
-		mutedStyle.Render(fmt.Sprintf("404:%d", count404)),
-		yellowStyle.Render(fmt.Sprintf("429:%d", count429)),
-		errorStyle.Render(fmt.Sprintf("5xx:%d", count500)),
-		errorStyle.Render(fmt.Sprintf("Err:%d", connErr)),
+		statsLine,
 		bar,
 		highlightStyle.Render(fmt.Sprintf("%.1f%%", progressPct)),
 		pinkStyle.Render(fmt.Sprintf("%d", rps)),
@@ -1124,6 +1150,8 @@ func (m Model) View() string {
 		mutedStyle.Render(elapsed.String()),
 		mutedStyle.Render(fmt.Sprintf("(%d/%d)", processed, total)),
 	)
+	sep := separatorStyle.Render(strings.Repeat("─", m.width))
+	header = header + sep
 
 	var mainContent string
 
@@ -1165,13 +1193,26 @@ func (m Model) View() string {
 
 		footer = cmdLine
 	} else {
+		footerBarStyle := lipgloss.NewStyle().
+			Foreground(DraculaCyan).
+			Bold(true).
+			Width(m.width).
+			PaddingLeft(2)
 		if m.state == StateDetail {
-			footer = mutedStyle.Render("  Press 'Esc' or 'q' to return to list | Up/Down to scroll")
+			footer = footerBarStyle.Render("Press 'Esc' or 'q' to return to list | Up/Down to scroll")
 		} else {
-			footer = mutedStyle.Render("  Press ':' for commands | 'p' to pause | '?' for help | 'q' to quit | 'Enter' on hit to view")
+			footer = footerBarStyle.Render("Press ':' for commands | 'p' to pause | '?' for help | 'q' to quit | 'Enter' on hit to view")
 		}
 	}
+	footerSep := separatorStyle.Render(strings.Repeat("─", m.width))
+	footer = footerSep + "\n" + footer
+
+	remainingHeight := m.height - lipgloss.Height(header) - lipgloss.Height(footer)
+	if remainingHeight < 1 {
+		remainingHeight = 1
+	}
+	paddedContent := lipgloss.NewStyle().Height(remainingHeight).Render(mainContent)
 
 	// Compose
-	return lipgloss.JoinVertical(lipgloss.Top, header, mainContent, footer)
+	return lipgloss.JoinVertical(lipgloss.Top, header, paddedContent, footer)
 }

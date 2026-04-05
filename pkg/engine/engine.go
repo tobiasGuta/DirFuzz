@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/csv"
@@ -150,23 +151,31 @@ type Engine struct {
 
 // Result holds the details of a successful fuzzing hit.
 type Result struct {
-	Path          string            `json:"path"`
-	Method        string            `json:"method,omitempty"`
-	StatusCode    int               `json:"status"`
-	Size          int               `json:"length"`
-	Words         int               `json:"words,omitempty"`
-	Lines         int               `json:"lines,omitempty"`
-	ContentType   string            `json:"content_type,omitempty"`
-	Duration      time.Duration     `json:"duration,omitempty"`
-	Redirect      string            `json:"redirect,omitempty"`
-	Headers       map[string]string `json:"headers,omitempty"`
-	IsEagleAlert  bool              `json:"eagle_alert,omitempty"`
-	OldStatusCode int               `json:"old_status,omitempty"`
-	IsAutoFilter  bool              `json:"auto_filter,omitempty"`
-	URL           string            `json:"url,omitempty"`
-	Request       string            `json:"request,omitempty"`
-	Response      string            `json:"response,omitempty"`
+	Path             string            `json:"path"`
+	Method           string            `json:"method,omitempty"`
+	StatusCode       int               `json:"status"`
+	Forbidden403Type string            `json:"forbidden_403_type,omitempty"`
+	Size             int               `json:"length"`
+	Words            int               `json:"words,omitempty"`
+	Lines            int               `json:"lines,omitempty"`
+	ContentType      string            `json:"content_type,omitempty"`
+	Duration         time.Duration     `json:"duration,omitempty"`
+	Redirect         string            `json:"redirect,omitempty"`
+	Headers          map[string]string `json:"headers,omitempty"`
+	IsEagleAlert     bool              `json:"eagle_alert,omitempty"`
+	OldStatusCode    int               `json:"old_status,omitempty"`
+	IsAutoFilter     bool              `json:"auto_filter,omitempty"`
+	URL              string            `json:"url,omitempty"`
+	Request          string            `json:"request,omitempty"`
+	Response         string            `json:"response,omitempty"`
 }
+
+const (
+	Forbidden403TypeCFWAFBlock = "CF_WAF_BLOCK"
+	Forbidden403TypeCFAdmin403 = "CF_ADMIN_403"
+	Forbidden403TypeNginx403   = "NGINX_403"
+	Forbidden403TypeGeneric403 = "GENERIC_403"
+)
 
 // String returns a string representation of the result for CLI output.
 func (r Result) String() string {
@@ -180,6 +189,9 @@ func (r Result) String() string {
 	if val, ok := r.Headers["X-Powered-By"]; ok {
 		extras += fmt.Sprintf(" [X-Powered-By: %s]", val)
 	}
+	if r.Forbidden403Type != "" {
+		extras += fmt.Sprintf(" [%s]", r.Forbidden403Type)
+	}
 	if r.ContentType != "" {
 		extras += fmt.Sprintf(" [%s]", r.ContentType)
 	}
@@ -192,6 +204,48 @@ func (r Result) String() string {
 	}
 	return fmt.Sprintf("[+] [%s] HIT: %s (Status: %d, Size: %d, Words: %d, Lines: %d)%s",
 		methodStr, r.Path, r.StatusCode, r.Size, r.Words, r.Lines, extras)
+}
+
+// Classify403 identifies known types of 403 responses based on body/header signals.
+func Classify403(body []byte, headers string) string {
+	lowerBody := bytes.ToLower(body)
+	hasCFWAFBlock := bytes.Contains(lowerBody, []byte("attention required! | cloudflare")) ||
+		bytes.Contains(lowerBody, []byte("sorry, you have been blocked")) ||
+		bytes.Contains(lowerBody, []byte("cf-error-details"))
+	if hasCFWAFBlock {
+		return Forbidden403TypeCFWAFBlock
+	}
+
+	hasCFAdmin403 := bytes.Contains(lowerBody, []byte("request forbidden by administrative rules"))
+	hasNginx403 := bytes.Contains(lowerBody, []byte("<center>nginx</center>"))
+
+	normalizedHeaders := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(headers, "\r\n", "\n"), "\r", "\n"))
+	headerLines := strings.Split(normalizedHeaders, "\n")
+	hasCfRay := false
+	hasCfCacheStatus := false
+	for _, line := range headerLines {
+		idx := strings.Index(line, ":")
+		if idx == -1 {
+			continue
+		}
+
+		key := strings.TrimSpace(line[:idx])
+		switch key {
+		case "cf-ray":
+			hasCfRay = true
+		case "cf-cache-status":
+			hasCfCacheStatus = true
+		}
+	}
+
+	if hasCFAdmin403 && (hasCfRay || hasCfCacheStatus) {
+		return Forbidden403TypeCFAdmin403
+	}
+	if hasNginx403 && !hasCfRay {
+		return Forbidden403TypeNginx403
+	}
+
+	return Forbidden403TypeGeneric403
 }
 
 // ToCSV returns a CSV-formatted line for the result.
@@ -1439,9 +1493,32 @@ func (e *Engine) worker(id int) {
 			continue
 		}
 
+		forbidden403Type := ""
+		if resp.StatusCode == 403 {
+			classifyBody := resp.Body
+			classifyHeaders := resp.Headers
+
+			// Keep HEAD-first strategy, but enrich 403 classification with a one-off GET body.
+			if successfulMethod == "HEAD" {
+				followupGetRequest := []byte(fmt.Sprintf(
+					"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: %s\r\n%sAccept: */*\r\n\r\n",
+					reqPath, reqHost, ua, headersStr.String(),
+				))
+				if followupResp, followupErr := e.executeRequestWithRetry(e.scannerCtx, currentBaseURL, followupGetRequest, 3*time.Second, proxyAddr); followupErr == nil {
+					classifyBody = followupResp.Body
+					classifyHeaders = followupResp.Headers
+				}
+			}
+
+			forbidden403Type = Classify403(classifyBody, classifyHeaders)
+		}
+
 		// Smart Filter Logic
 		if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 403 {
 			fpKey := fmt.Sprintf("%d:%d", resp.StatusCode, bodySize)
+			if resp.StatusCode == 403 {
+				fpKey = fmt.Sprintf("403:%s:%d", forbidden403Type, bodySize)
+			}
 
 			e.fpMutex.Lock()
 			e.fpCounts[fpKey]++
@@ -1481,6 +1558,9 @@ func (e *Engine) worker(id int) {
 				if strings.EqualFold(key, "X-Powered-By") {
 					capturedHeaders["X-Powered-By"] = val
 				}
+				if strings.EqualFold(key, "Cf-Ray") {
+					capturedHeaders["Cf-Ray"] = val
+				}
 			}
 		}
 
@@ -1510,6 +1590,9 @@ func (e *Engine) worker(id int) {
 		}
 		if finalRedirectURL != "" && resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			result.Redirect = finalRedirectURL
+		}
+		if resp.StatusCode == 403 {
+			result.Forbidden403Type = forbidden403Type
 		}
 
 		// Eagle Mode Check
