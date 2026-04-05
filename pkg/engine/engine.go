@@ -510,7 +510,21 @@ func (e *Engine) SetFilterRegex(pattern string) error {
 func (e *Engine) UpdateUserAgent(ua string) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
-	e.Config.UserAgent = ua
+	normalized := normalizeUserAgent(ua)
+	if normalized == "" {
+		normalized = "DirFuzz/2.0"
+	}
+	e.Config.UserAgent = normalized
+}
+
+// normalizeUserAgent strips an accidental leading "User-Agent:" prefix from values.
+func normalizeUserAgent(ua string) string {
+	ua = strings.TrimSpace(ua)
+	const prefix = "User-Agent:"
+	if len(ua) >= len(prefix) && strings.EqualFold(ua[:len(prefix)], prefix) {
+		ua = strings.TrimSpace(ua[len(prefix):])
+	}
+	return ua
 }
 
 // SetDelay sets the delay and updates the rate limiter accordingly.
@@ -525,6 +539,18 @@ func (e *Engine) SetDelay(d time.Duration) {
 func (e *Engine) AddHeader(key, val string) {
 	e.Config.Lock()
 	defer e.Config.Unlock()
+	if strings.EqualFold(strings.TrimSpace(key), "User-Agent") {
+		e.Config.UserAgent = normalizeUserAgent(val)
+		if e.Config.UserAgent == "" {
+			e.Config.UserAgent = "DirFuzz/2.0"
+		}
+		for hk := range e.Config.Headers {
+			if strings.EqualFold(hk, "User-Agent") {
+				delete(e.Config.Headers, hk)
+			}
+		}
+		return
+	}
 	e.Config.Headers[key] = val
 }
 
@@ -1134,6 +1160,10 @@ func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, target
 	resp := initialResp
 	finalURL := ""
 	currentURL := targetURL
+	ua = normalizeUserAgent(ua)
+	if ua == "" {
+		ua = "DirFuzz/2.0"
+	}
 
 	for i := 0; i < maxRedirects; i++ {
 		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
@@ -1167,6 +1197,9 @@ func (e *Engine) followRedirectChain(initialResp *httpclient.RawResponse, target
 
 		var headersStr strings.Builder
 		for k, v := range headers {
+			if strings.EqualFold(k, "User-Agent") {
+				continue
+			}
 			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 
@@ -1247,6 +1280,10 @@ func (e *Engine) worker(id int) {
 		ua := e.Config.UserAgent
 		headers := make(map[string]string)
 		for k, v := range e.Config.Headers {
+			if strings.EqualFold(k, "User-Agent") {
+				ua = v
+				continue
+			}
 			headers[k] = v
 		}
 		matchCodes := make(map[int]bool)
@@ -1323,7 +1360,10 @@ func (e *Engine) worker(id int) {
 		}
 
 		// Inject payload into User-Agent
-		ua = strings.ReplaceAll(ua, "{PAYLOAD}", payload)
+		ua = normalizeUserAgent(strings.ReplaceAll(ua, "{PAYLOAD}", payload))
+		if ua == "" {
+			ua = "DirFuzz/2.0"
+		}
 
 		// Build headers string
 		var headersStr strings.Builder
