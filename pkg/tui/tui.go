@@ -4,6 +4,7 @@ import (
 	"dirfuzz/pkg/engine"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -92,6 +93,7 @@ type ViewState int
 const (
 	StateList ViewState = iota
 	StateDetail
+	StateCommand
 )
 
 // Model is the BubbleTea model for the TUI.
@@ -116,6 +118,8 @@ type Model struct {
 	// Detail Viewports
 	reqViewport viewport.Model
 	resViewport viewport.Model
+	cmdOutput   []string
+	cmdViewport viewport.Model
 
 	// Telemetry display
 	startTime time.Time
@@ -147,6 +151,7 @@ func NewModel(eng *engine.Engine, resultsCh <-chan engine.Result) Model {
 
 	reqVp := viewport.New(40, 20)
 	resVp := viewport.New(40, 20)
+	cmdVp := viewport.New(80, 10)
 
 	m := Model{
 		Engine:      eng,
@@ -154,9 +159,11 @@ func NewModel(eng *engine.Engine, resultsCh <-chan engine.Result) Model {
 		viewport:    vp,
 		reqViewport: reqVp,
 		resViewport: resVp,
+		cmdViewport: cmdVp,
 		textInput:   ti,
 		logs:        []string{},
 		hits:        []engine.Result{},
+		cmdOutput:   []string{},
 		startTime:   time.Now(),
 		state:       StateList,
 	}
@@ -327,60 +334,255 @@ func (m *Model) initCommands() {
 			return statusStyle.Render("[*] Scan restarted")
 		}},
 		{Name: "config", Description: "Show current config", Args: "", Handler: func(m *Model, args string) string {
-			ua, filters, headers, delay, exts, followRedir := m.Engine.ConfigSnapshot()
 			m.Engine.Config.RLock()
+			ua := m.Engine.Config.UserAgent
+			delay := m.Engine.Config.Delay
+			headers := make(map[string]string, len(m.Engine.Config.Headers))
+			for k, v := range m.Engine.Config.Headers {
+				headers[k] = v
+			}
+
+			filters := make([]int, 0, len(m.Engine.Config.FilterSizes))
+			for size := range m.Engine.Config.FilterSizes {
+				filters = append(filters, size)
+			}
+
+			matchCodes := make([]int, 0, len(m.Engine.Config.MatchCodes))
+			for code := range m.Engine.Config.MatchCodes {
+				matchCodes = append(matchCodes, code)
+			}
+
+			exts := make([]string, len(m.Engine.Config.Extensions))
+			copy(exts, m.Engine.Config.Extensions)
+			methods := make([]string, len(m.Engine.Config.Methods))
+			copy(methods, m.Engine.Config.Methods)
+
+			workers := m.Engine.Config.MaxWorkers
 			recursive := m.Engine.Config.Recursive
 			maxDepth := m.Engine.Config.MaxDepth
 			mutate := m.Engine.Config.Mutate
+			smartAPI := m.Engine.Config.SmartAPI
+			followRedir := m.Engine.Config.FollowRedirects
+			maxRedirects := m.Engine.Config.MaxRedirects
 			matchRegex := m.Engine.Config.MatchRegex
 			filterRegex := m.Engine.Config.FilterRegex
 			filterWords := m.Engine.Config.FilterWords
 			filterLines := m.Engine.Config.FilterLines
+			matchWords := m.Engine.Config.MatchWords
+			matchLines := m.Engine.Config.MatchLines
 			body := m.Engine.Config.RequestBody
+			wordlist := m.Engine.Config.WordlistPath
 			outputFmt := m.Engine.Config.OutputFormat
+			outputFile := m.Engine.Config.OutputFile
 			filterDurMin := m.Engine.Config.FilterRTMin
 			filterDurMax := m.Engine.Config.FilterRTMax
 			proxyOut := m.Engine.Config.ProxyOut
+			timeout := m.Engine.Config.Timeout
+			insecure := m.Engine.Config.Insecure
+			autoFilterThreshold := m.Engine.Config.AutoFilterThreshold
+			maxRetries := m.Engine.Config.MaxRetries
 			m.Engine.Config.RUnlock()
 
-			var sb strings.Builder
+			sort.Ints(filters)
+			sort.Ints(matchCodes)
 
-			sb.WriteString(pinkStyle.Render("=== Current Config ===") + "\n")
-			sb.WriteString(fmt.Sprintf("  Target:     %s\n", highlightStyle.Render(m.Engine.BaseURL())))
-			sb.WriteString(fmt.Sprintf("  UA:         %s\n", ua))
-			sb.WriteString(fmt.Sprintf("  Delay:      %s\n", delay))
-			sb.WriteString(fmt.Sprintf("  Extensions: %v\n", exts))
-			sb.WriteString(fmt.Sprintf("  Filters:    %v\n", filters))
-			sb.WriteString(fmt.Sprintf("  Headers:    %v\n", headers))
-			sb.WriteString(fmt.Sprintf("  Recursive:  %v (depth: %d)\n", recursive, maxDepth))
-			sb.WriteString(fmt.Sprintf("  Mutate:     %v\n", mutate))
-			sb.WriteString(fmt.Sprintf("  Follow:     %v\n", followRedir))
-			sb.WriteString(fmt.Sprintf("  OutputFmt:  %s\n", outputFmt))
+			headerKeys := make([]string, 0, len(headers))
+			for k := range headers {
+				headerKeys = append(headerKeys, k)
+			}
+			sort.Strings(headerKeys)
+
+			intsToCSV := func(nums []int) string {
+				parts := make([]string, len(nums))
+				for i, n := range nums {
+					parts[i] = strconv.Itoa(n)
+				}
+				return strings.Join(parts, ",")
+			}
+
+			target := m.Engine.BaseURL()
+			wrapWidth := m.cmdViewport.Width - 6
+			if wrapWidth < 40 {
+				wrapWidth = 80
+			}
+
+			var sb strings.Builder
+			writeLine := func(line string) {
+				sb.WriteString(wrapText(line, wrapWidth))
+				sb.WriteString("\n")
+			}
+
+			writeLine("=== Current Config ===")
+			writeLine(fmt.Sprintf("Target: %s", target))
+			if wordlist != "" {
+				writeLine(fmt.Sprintf("Wordlist: %s", wordlist))
+			}
+			writeLine(fmt.Sprintf("Workers: %d", workers))
+			writeLine(fmt.Sprintf("Delay: %s", delay))
+			writeLine(fmt.Sprintf("UA: %s", ua))
+			if len(exts) > 0 {
+				writeLine(fmt.Sprintf("Extensions: %s", strings.Join(exts, ",")))
+			}
+			if len(methods) > 0 {
+				writeLine(fmt.Sprintf("Methods: %s", strings.Join(methods, ",")))
+			}
+			if len(matchCodes) > 0 {
+				writeLine(fmt.Sprintf("MatchCodes: %s", intsToCSV(matchCodes)))
+			}
+			if len(filters) > 0 {
+				writeLine(fmt.Sprintf("FilterSizes: %s", intsToCSV(filters)))
+			}
+			if len(headerKeys) > 0 {
+				writeLine("Headers:")
+				for _, k := range headerKeys {
+					writeLine(fmt.Sprintf("  - %s: %s", k, headers[k]))
+				}
+			}
+			writeLine(fmt.Sprintf("Recursive: %v (depth: %d)", recursive, maxDepth))
+			writeLine(fmt.Sprintf("Mutate: %v", mutate))
+			writeLine(fmt.Sprintf("Follow: %v (max-redirects: %d)", followRedir, maxRedirects))
+			writeLine(fmt.Sprintf("OutputFmt: %s", outputFmt))
+			if outputFile != "" {
+				writeLine(fmt.Sprintf("OutputFile: %s", outputFile))
+			}
+			writeLine(fmt.Sprintf("Timeout: %s", timeout))
+			writeLine(fmt.Sprintf("InsecureTLS: %v", insecure))
+			writeLine(fmt.Sprintf("SmartAPI: %v", smartAPI))
+			writeLine(fmt.Sprintf("AutoFilterThreshold: %d", autoFilterThreshold))
+			writeLine(fmt.Sprintf("Retries: %d", maxRetries))
 			if matchRegex != "" {
-				sb.WriteString(fmt.Sprintf("  MatchRegex: %s\n", matchRegex))
+				writeLine(fmt.Sprintf("MatchRegex: %s", matchRegex))
 			}
 			if filterRegex != "" {
-				sb.WriteString(fmt.Sprintf("  FilterRegex: %s\n", filterRegex))
+				writeLine(fmt.Sprintf("FilterRegex: %s", filterRegex))
 			}
 			if filterWords >= 0 {
-				sb.WriteString(fmt.Sprintf("  FilterWords: %d\n", filterWords))
+				writeLine(fmt.Sprintf("FilterWords: %d", filterWords))
 			}
 			if filterLines >= 0 {
-				sb.WriteString(fmt.Sprintf("  FilterLines: %d\n", filterLines))
+				writeLine(fmt.Sprintf("FilterLines: %d", filterLines))
+			}
+			if matchWords >= 0 {
+				writeLine(fmt.Sprintf("MatchWords: %d", matchWords))
+			}
+			if matchLines >= 0 {
+				writeLine(fmt.Sprintf("MatchLines: %d", matchLines))
 			}
 			if filterDurMin > 0 {
-				sb.WriteString(fmt.Sprintf("  RTmin:      %s\n", filterDurMin))
+				writeLine(fmt.Sprintf("RTmin: %s", filterDurMin))
 			}
 			if filterDurMax > 0 {
-				sb.WriteString(fmt.Sprintf("  RTmax:      %s\n", filterDurMax))
+				writeLine(fmt.Sprintf("RTmax: %s", filterDurMax))
 			}
 			if proxyOut != "" {
-				sb.WriteString(fmt.Sprintf("  ProxyOut:   %s\n", proxyOut))
+				writeLine(fmt.Sprintf("ProxyOut: %s", proxyOut))
 			}
 			if body != "" {
-				sb.WriteString(fmt.Sprintf("  Body:       %s\n", body))
+				writeLine(fmt.Sprintf("Body: %s", body))
 			}
-			return sb.String()
+
+			writeLine("")
+			writeLine("CLI switches (effective now):")
+			writeLine(fmt.Sprintf("  -u %s", target))
+			if wordlist != "" {
+				writeLine(fmt.Sprintf("  -w %s", wordlist))
+			}
+			if workers != 50 {
+				writeLine(fmt.Sprintf("  -t %d", workers))
+			}
+			if delay > 0 {
+				writeLine(fmt.Sprintf("  -delay %s", delay))
+			}
+			if ua != "" {
+				writeLine(fmt.Sprintf("  -ua %q", ua))
+			}
+			for _, k := range headerKeys {
+				if strings.EqualFold(k, "Cookie") {
+					writeLine(fmt.Sprintf("  -b %q", headers[k]))
+				} else {
+					writeLine(fmt.Sprintf("  -h %q", fmt.Sprintf("%s: %s", k, headers[k])))
+				}
+			}
+			if len(exts) > 0 {
+				writeLine(fmt.Sprintf("  -e %s", strings.Join(exts, ",")))
+			}
+			if len(matchCodes) > 0 {
+				writeLine(fmt.Sprintf("  -mc %s", intsToCSV(matchCodes)))
+			}
+			if len(filters) > 0 {
+				writeLine(fmt.Sprintf("  -fs %s", intsToCSV(filters)))
+			}
+			if mutate {
+				writeLine("  -mutate")
+			}
+			if recursive {
+				writeLine("  -r")
+			}
+			if maxDepth != 3 {
+				writeLine(fmt.Sprintf("  -depth %d", maxDepth))
+			}
+			if len(methods) > 0 {
+				writeLine(fmt.Sprintf("  -m %s", strings.Join(methods, ",")))
+			}
+			if smartAPI {
+				writeLine("  -smart-api")
+			}
+			if body != "" {
+				writeLine(fmt.Sprintf("  -d %q", body))
+			}
+			if followRedir {
+				writeLine("  -follow")
+			}
+			if maxRedirects != 5 {
+				writeLine(fmt.Sprintf("  -max-redirects %d", maxRedirects))
+			}
+			if matchRegex != "" {
+				writeLine(fmt.Sprintf("  -mr %q", matchRegex))
+			}
+			if filterRegex != "" {
+				writeLine(fmt.Sprintf("  -fr %q", filterRegex))
+			}
+			if filterWords >= 0 {
+				writeLine(fmt.Sprintf("  -fw %d", filterWords))
+			}
+			if filterLines >= 0 {
+				writeLine(fmt.Sprintf("  -fl %d", filterLines))
+			}
+			if matchWords >= 0 {
+				writeLine(fmt.Sprintf("  -mw %d", matchWords))
+			}
+			if matchLines >= 0 {
+				writeLine(fmt.Sprintf("  -ml %d", matchLines))
+			}
+			if filterDurMin > 0 {
+				writeLine(fmt.Sprintf("  -rt-min %s", filterDurMin))
+			}
+			if filterDurMax > 0 {
+				writeLine(fmt.Sprintf("  -rt-max %s", filterDurMax))
+			}
+			if outputFmt != "" {
+				writeLine(fmt.Sprintf("  -of %s", outputFmt))
+			}
+			if outputFile != "" {
+				writeLine(fmt.Sprintf("  -o %s", outputFile))
+			}
+			if timeout > 0 {
+				writeLine(fmt.Sprintf("  -timeout %s", timeout))
+			}
+			if insecure {
+				writeLine("  -k")
+			}
+			if proxyOut != "" {
+				writeLine(fmt.Sprintf("  -proxy-out %s", proxyOut))
+			}
+			if autoFilterThreshold != engine.DefaultAutoFilterThreshold {
+				writeLine(fmt.Sprintf("  -af %d", autoFilterThreshold))
+			}
+			if maxRetries > 0 {
+				writeLine(fmt.Sprintf("  -retry %d", maxRetries))
+			}
+
+			return strings.TrimRight(sb.String(), "\n")
 		}},
 		{Name: "mr", Description: "Set match regex", Args: "<pattern>", Handler: func(m *Model, args string) string {
 			pattern := strings.TrimSpace(args)
@@ -501,6 +703,11 @@ func (m *Model) initCommands() {
 			m.listScrollIdx = 0
 			return ""
 		}},
+		{Name: "clearcmd", Description: "Clear command panel output", Args: "", Handler: func(m *Model, args string) string {
+			m.cmdOutput = []string{}
+			m.cmdViewport.SetContent("")
+			return ""
+		}},
 	}
 }
 
@@ -551,6 +758,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.ready {
 			m.viewport = viewport.New(vpWidth, vpHeight)
 			m.viewport.SetContent(strings.Join(m.logs, "\n"))
+			m.cmdViewport = viewport.New(vpWidth, 12)
+			m.cmdViewport.SetContent(strings.Join(m.cmdOutput, "\n"))
 
 			// Detail viewports
 			m.reqViewport = viewport.New(paneWidth, vpHeight-2)
@@ -560,12 +769,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.viewport.Width = vpWidth
 			m.viewport.Height = vpHeight
+			m.cmdViewport.Width = vpWidth
+			m.cmdViewport.Height = 12
 
 			m.reqViewport.Width = paneWidth
 			m.reqViewport.Height = vpHeight - 2
 			m.resViewport.Width = paneWidth
 			m.resViewport.Height = vpHeight - 2
 		}
+		m.cmdViewport.Width = vpWidth
+		m.cmdViewport.Height = 12
 		m.textInput.Width = vpWidth - 4
 
 	case TickMsg:
@@ -608,6 +821,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case ":":
 			if !m.commandMode && m.state == StateList {
 				m.commandMode = true
+				m.state = StateCommand
 				m.textInput.SetValue("")
 				m.textInput.Focus()
 				m.suggestions = nil
@@ -618,6 +832,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.commandMode {
 				m.commandMode = false
+				m.state = StateList
 				m.textInput.Blur()
 				m.suggestions = nil
 				return m, nil
@@ -633,15 +848,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if val != "" {
 					output := m.executeCommand(val)
 					if output != "" {
-						m.appendLog(output, nil)
+						m.appendCmd(output)
 					}
 					m.cmdHistory = append(m.cmdHistory, val)
 					m.cmdHistoryIdx = len(m.cmdHistory)
 				}
-				m.commandMode = false
-				m.textInput.Blur()
 				m.textInput.SetValue("")
 				m.suggestions = nil
+				m.selectedSugIdx = 0
+				m.commandMode = true
+				m.state = StateCommand
+				m.textInput.Focus()
 				return m, nil
 			}
 
@@ -665,14 +882,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "up", "k":
-			if m.commandMode && len(m.suggestions) > 0 {
+			if m.commandMode && m.state != StateCommand && len(m.suggestions) > 0 {
 				m.selectedSugIdx--
 				if m.selectedSugIdx < 0 {
 					m.selectedSugIdx = len(m.suggestions) - 1
 				}
 				return m, nil
 			}
-			if m.commandMode && len(m.cmdHistory) > 0 {
+			if m.commandMode && m.state != StateCommand && len(m.cmdHistory) > 0 {
 				if m.cmdHistoryIdx > 0 {
 					m.cmdHistoryIdx--
 					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
@@ -697,16 +914,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resViewport.LineUp(1)
 				return m, nil
 			}
+			if m.state == StateCommand {
+				m.cmdViewport.LineUp(1)
+				return m, nil
+			}
 
 		case "down", "j":
-			if m.commandMode && len(m.suggestions) > 0 {
+			if m.commandMode && m.state != StateCommand && len(m.suggestions) > 0 {
 				m.selectedSugIdx++
 				if m.selectedSugIdx >= len(m.suggestions) {
 					m.selectedSugIdx = 0
 				}
 				return m, nil
 			}
-			if m.commandMode && len(m.cmdHistory) > 0 {
+			if m.commandMode && m.state != StateCommand && len(m.cmdHistory) > 0 {
 				if m.cmdHistoryIdx < len(m.cmdHistory)-1 {
 					m.cmdHistoryIdx++
 					m.textInput.SetValue(m.cmdHistory[m.cmdHistoryIdx])
@@ -729,6 +950,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == StateDetail {
 				m.reqViewport.LineDown(1)
 				m.resViewport.LineDown(1)
+				return m, nil
+			}
+			if m.state == StateCommand {
+				m.cmdViewport.LineDown(1)
 				return m, nil
 			}
 
@@ -825,13 +1050,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.Engine.Config.RUnlock()
 			m.Engine.SetPaused(!p)
 			if p {
-				m.appendLog(statusStyle.Render("[*] Scan resumed"), nil)
+				m.appendCmd(statusStyle.Render("[*] Scan resumed"))
 			} else {
-				m.appendLog(orangeStyle.Render("[*] Scan paused"), nil)
+				m.appendCmd(orangeStyle.Render("[*] Scan paused"))
 			}
 		case "?":
 			output := m.commands[0].Handler(&m, "")
-			m.appendLog(output, nil)
+			m.appendCmd(output)
 		}
 	}
 
@@ -987,6 +1212,19 @@ func (m *Model) appendLog(text string, hit *engine.Result) {
 
 	m.renderListView()
 	m.viewport.GotoBottom()
+}
+
+func (m *Model) appendCmd(text string) {
+	if text == "" {
+		return
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if line != "" {
+			m.cmdOutput = append(m.cmdOutput, line)
+		}
+	}
+	m.cmdViewport.SetContent(strings.Join(m.cmdOutput, "\n"))
+	m.cmdViewport.GotoBottom()
 }
 
 // executeCommand parses and runs a TUI command.
@@ -1171,11 +1409,56 @@ func (m Model) View() string {
 			),
 		)
 		mainContent = lipgloss.JoinHorizontal(lipgloss.Top, reqPane, resPane)
+	} else if m.state == StateCommand {
+		resultsHeight := m.height - lipgloss.Height(header) - 16 // 16 = cmd panel
+		if resultsHeight < 3 {
+			resultsHeight = 3
+		}
+		frozenVp := lipgloss.NewStyle().Height(resultsHeight).Render(m.viewport.View())
+
+		cmdPanelStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(DraculaPurple).
+			Width(m.width-2).
+			Height(12).
+			Padding(0, 1)
+
+		cmdTitle := pinkStyle.Render(" ⚡ Command Panel ") +
+			mutedStyle.Render(" (Esc to close, ':help' for commands) ")
+		promptLine := cmdPromptStyle.Render(":") + m.textInput.View()
+
+		suggestionsBlock := ""
+		if len(m.suggestions) > 0 {
+			var sugLines []string
+			for i, s := range m.suggestions {
+				if i == m.selectedSugIdx {
+					sugLines = append(sugLines, statusStyle.Render("> "+s))
+				} else {
+					sugLines = append(sugLines, mutedStyle.Render("  "+s))
+				}
+			}
+			suggestionsBlock = strings.Join(sugLines, "\n")
+		}
+
+		cmdSections := []string{
+			cmdTitle,
+			m.cmdViewport.View(),
+			separatorStyle.Render(strings.Repeat("─", m.width-4)),
+		}
+		if suggestionsBlock != "" {
+			cmdSections = append(cmdSections, suggestionsBlock)
+		}
+		cmdSections = append(cmdSections, promptLine)
+
+		cmdContent := lipgloss.JoinVertical(lipgloss.Top, cmdSections...)
+		cmdPanel := cmdPanelStyle.Render(cmdContent)
+
+		mainContent = lipgloss.JoinVertical(lipgloss.Top, frozenVp, cmdPanel)
 	}
 
 	// Footer
 	var footer string
-	if m.commandMode {
+	if m.commandMode && m.state != StateCommand {
 		cmdLine := cmdPromptStyle.Render(":") + m.textInput.View()
 
 		// Show suggestions
@@ -1198,7 +1481,9 @@ func (m Model) View() string {
 			Bold(true).
 			Width(m.width).
 			PaddingLeft(2)
-		if m.state == StateDetail {
+		if m.state == StateCommand {
+			footer = footerBarStyle.Render("Esc: close panel | Enter: run command | Up/Down: scroll output")
+		} else if m.state == StateDetail {
 			footer = footerBarStyle.Render("Press 'Esc' or 'q' to return to list | Up/Down to scroll")
 		} else {
 			footer = footerBarStyle.Render("Press ':' for commands | 'p' to pause | '?' for help | 'q' to quit | 'Enter' on hit to view")
