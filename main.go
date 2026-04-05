@@ -301,7 +301,7 @@ func main() {
 
 	// Print version and exit
 	if *version {
-		fmt.Println("🦇 DirFuzz v2.0")
+		fmt.Println("🦇 DirFuzz v2.1")
 		os.Exit(0)
 	}
 
