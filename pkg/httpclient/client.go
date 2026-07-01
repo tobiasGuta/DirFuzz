@@ -1,0 +1,1232 @@
+package httpclient
+
+import (
+	"bufio"
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"dirfuzz/pkg/netutil"
+
+	"github.com/andybalholm/brotli"
+	"golang.org/x/net/proxy"
+)
+
+// MaxBodySize limits response body reading to prevent memory exhaustion.
+const MaxBodySize = 5 * 1024 * 1024 // 5 MB
+
+var lookupIPAddrContext = net.DefaultResolver.LookupIPAddr
+
+// RawResponse holds the unparsed, raw response data.
+type RawResponse struct {
+	StatusCode int
+	Headers    string
+	HeaderMap  map[string]string
+	Body       []byte
+	Raw        []byte
+	Duration   time.Duration
+	// BodyComplete is true when the response body was fully read from the
+	// network (either by satisfying Content-Length or by seeing the final
+	// chunk terminator for chunked responses). When false the connection
+	// should not be returned to a keep-alive pool.
+	BodyComplete bool
+	// BodyEncoded indicates that the response body contains an encoding that
+	// this client cannot decode (e.g. Brotli / "br") or an attempted
+	// decompression failed. When true callers should avoid content-based
+	// metrics (word/line counts) because the body is still encoded.
+	BodyEncoded bool
+}
+
+// AntiBotSignal summarises whether a response looks like a WAF or challenge
+// page and exposes any Set-Cookie headers that can be persisted.
+type AntiBotSignal struct {
+	Blocked  bool
+	Provider string
+	Reasons  []string
+	Cookies  []*http.Cookie
+}
+
+// GetHeader extracts a header value from the raw headers string (case-insensitive).
+func (r *RawResponse) GetHeader(key string) string {
+	if r == nil {
+		return ""
+	}
+	lowerKey := strings.ToLower(key)
+	if r.HeaderMap != nil {
+		if v, ok := r.HeaderMap[lowerKey]; ok {
+			return v
+		}
+		return ""
+	}
+	// Fallback: parse the raw header string (for compatibility).
+	normalized := strings.ReplaceAll(r.Headers, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			k := strings.ToLower(strings.TrimSpace(parts[0]))
+			if k == lowerKey {
+				return strings.TrimSpace(parts[1])
+			}
+		}
+	}
+	return ""
+}
+
+// ParseSetCookies extracts all Set-Cookie headers from a raw response header
+// block. Session cookies are preserved as session cookies rather than being
+// converted to already-expired timestamps.
+func ParseSetCookies(headers string) []*http.Cookie {
+	if headers == "" {
+		return nil
+	}
+
+	hdr := http.Header{}
+	normalized := strings.ReplaceAll(headers, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	lines := strings.Split(normalized, "\n")
+	for _, line := range lines[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		hdr.Add(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+	}
+
+	resp := &http.Response{Header: hdr}
+	return resp.Cookies()
+}
+
+func isChallengeText(bodyLower string) bool {
+	if bodyLower == "" {
+		return false
+	}
+
+	signatures := []string{
+		"just a moment",
+		"checking your browser",
+		"verify you are human",
+		"please enable cookies",
+		"enable javascript and cookies",
+		"security check",
+		"human verification",
+		"captcha",
+		"turnstile",
+		"cf-challenge",
+		"access denied",
+		"request blocked",
+		"pardon our interruption",
+		"attention required",
+		"one moment please",
+		"sorry, you have been blocked",
+		"cloudflare",
+		"incapsula incident id",
+		"data-dome",
+		"datadome",
+		"modsecurity",
+		"sucuri website firewall",
+		"barracuda web application firewall",
+		"the requested url was rejected",
+	}
+	for _, sig := range signatures {
+		if strings.Contains(bodyLower, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// InspectAntiBotResponse reports whether a response resembles a WAF block or
+// a JavaScript/captcha challenge page.
+func InspectAntiBotResponse(resp *RawResponse) AntiBotSignal {
+	if resp == nil {
+		return AntiBotSignal{}
+	}
+
+	headersLower := strings.ToLower(resp.Headers)
+	bodyLower := strings.ToLower(string(resp.Body))
+	signal := AntiBotSignal{
+		Cookies: ParseSetCookies(resp.Headers),
+	}
+	statusBlocked := resp.StatusCode == 403 || resp.StatusCode == 429
+
+	addReason := func(provider, reason string) {
+		signal.Blocked = true
+		if signal.Provider == "" {
+			signal.Provider = provider
+		}
+		signal.Reasons = append(signal.Reasons, reason)
+	}
+
+	if statusBlocked || isChallengeText(bodyLower) {
+		switch {
+		case strings.Contains(headersLower, "server: cloudflare") || strings.Contains(headersLower, "cf-ray:") || strings.Contains(headersLower, "cf-mitigated: challenge"):
+			addReason("cloudflare", "cloudflare header signature")
+		case strings.Contains(headersLower, "server: akamaighost") || strings.Contains(headersLower, "x-akamai-transformed:") || strings.Contains(bodyLower, "akamai"):
+			addReason("akamai", "akamai signature")
+		case strings.Contains(headersLower, "x-iinfo:") || strings.Contains(headersLower, "x-cdn: incapsula") || strings.Contains(bodyLower, "incapsula incident id"):
+			addReason("imperva", "imperva/incapsula signature")
+		case strings.Contains(headersLower, "server: sucuri") || strings.Contains(bodyLower, "sucuri website firewall"):
+			addReason("sucuri", "sucuri signature")
+		case strings.Contains(headersLower, "server: bigip") || strings.Contains(bodyLower, "the requested url was rejected"):
+			addReason("f5_bigip", "f5 bigip signature")
+		case strings.Contains(headersLower, "modsecurity") || strings.Contains(bodyLower, "modsecurity action"):
+			addReason("modsecurity", "modsecurity signature")
+		case strings.Contains(headersLower, "server: barracuda") || strings.Contains(bodyLower, "barracuda web application firewall"):
+			addReason("barracuda", "barracuda signature")
+		case strings.Contains(headersLower, "server: datadome") || strings.Contains(bodyLower, "datadome"):
+			addReason("datadome", "data dome signature")
+		}
+	}
+
+	if isChallengeText(bodyLower) {
+		if signal.Provider == "" {
+			signal.Provider = "generic"
+		}
+		addReason(signal.Provider, "challenge body signature")
+	}
+
+	if signal.Blocked {
+		return signal
+	}
+
+	// Challenge pages can legitimately return 200 while a JS interstitial is
+	// still running. Treat those as blocked as well so the engine can solve
+	// them before continuing the fuzz loop.
+	if isChallengeText(bodyLower) {
+		addReason("generic", "challenge body signature")
+	}
+	return signal
+}
+
+// ─── DNS cache ────────────────────────────────────────────────────────────────
+
+// SendRawRequest sends a raw HTTP request (no context, no pool).
+func SendRawRequest(targetURL string, rawRequest []byte, timeout time.Duration, proxyAddr string) (*RawResponse, error) {
+	return SendRawRequestWithContext(context.Background(), targetURL, rawRequest, timeout, proxyAddr, false)
+}
+
+// SendRawRequestWithContext sends a raw HTTP/1.1 request with full context
+// support, connection pooling, TLS cipher randomisation, and both SOCKS5 and
+// HTTP proxy support.
+//
+// Proxy URL formats accepted:
+//
+//	socks5://[user:pass@]host:port  — SOCKS5 (bare host:port also treated as SOCKS5)
+//	http://[user:pass@]host:port    — HTTP proxy (CONNECT for HTTPS, absolute-form for HTTP)
+func SendRawRequestWithContext(
+	ctx context.Context,
+	targetURL string,
+	rawRequest []byte,
+	timeout time.Duration,
+	proxyAddr string,
+	insecure bool,
+) (*RawResponse, error) {
+	return SendRawRequestWithContextPolicy(ctx, targetURL, rawRequest, timeout, proxyAddr, insecure, true)
+}
+
+// SendRawRequestWithContextPolicy is SendRawRequestWithContext with an explicit
+// private-network policy. When allowPrivateTargets is false, direct dials
+// resolve the target once, reject private IPs, and dial the validated IP.
+func SendRawRequestWithContextPolicy(
+	ctx context.Context,
+	targetURL string,
+	rawRequest []byte,
+	timeout time.Duration,
+	proxyAddr string,
+	insecure bool,
+	allowPrivateTargets bool,
+) (*RawResponse, error) {
+	start := time.Now()
+
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+
+	host := u.Hostname()
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	address := net.JoinHostPort(host, port)
+	insecureSuffix := ""
+	if insecure {
+		insecureSuffix = "+insecure"
+	}
+	privatePolicySuffix := ""
+	if allowPrivateTargets {
+		privatePolicySuffix = "+allow-private"
+	}
+	poolKey := u.Scheme + insecureSuffix + privatePolicySuffix + "://" + address
+
+	// Detect HTTP vs SOCKS5 proxy.
+	proxyIsHTTP := false
+	if proxyAddr != "" {
+		low := strings.ToLower(proxyAddr)
+		if strings.HasPrefix(low, "https://") {
+			return nil, fmt.Errorf("https proxy is not supported: %s", proxyAddr)
+		}
+		if strings.HasPrefix(low, "http://") {
+			proxyIsHTTP = true
+		}
+	}
+	if proxyIsHTTP && u.Scheme == "http" {
+		rawRequest = rewriteHTTPProxyRequest(rawRequest, u, proxyAddr)
+	}
+	if proxyAddr != "" && !allowPrivateTargets {
+		if err := validateDialAddress(ctx, "tcp", address, timeout, allowPrivateTargets); err != nil {
+			return nil, err
+		}
+	}
+
+	// Try to get a pooled connection (only when no proxy, proxy conns aren't trivially reusable).
+	var conn net.Conn
+	pooled := false
+	if proxyAddr == "" {
+		conn = DefaultPool.Get(poolKey)
+		if conn != nil {
+			pooled = true
+		}
+	}
+
+	// Dial a new connection if pool miss.
+	if conn == nil {
+		conn, err = dialNew(ctx, u.Scheme, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Send the request.
+	err = conn.SetDeadline(time.Now().Add(timeout))
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	if ctx.Err() != nil {
+		conn.Close()
+		return nil, ctx.Err()
+	}
+
+	_, writeErr := conn.Write(rawRequest)
+	if writeErr != nil {
+		// Stale pooled connection — discard and retry with a fresh connection.
+		conn.Close()
+		pooled = false
+		conn, err = dialNew(ctx, u.Scheme, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
+		if err != nil {
+			return nil, err
+		}
+		err = conn.SetDeadline(time.Now().Add(timeout))
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		if _, err = conn.Write(rawRequest); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("failed to write request: %w", err)
+		}
+	}
+
+	// Read the response.
+	resp, parseErr := parseRawResponse(conn)
+	if parseErr != nil {
+		conn.Close()
+		// If we used a pooled connection and it failed on read, it might have been stale/half-closed by the server
+		// after the write succeeded but before/during the read. Try once more on a fresh connection.
+		if pooled {
+			pooled = false
+			conn, err = dialNew(ctx, u.Scheme, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
+			if err != nil {
+				return nil, err
+			}
+			err = conn.SetDeadline(time.Now().Add(timeout))
+			if err != nil {
+				conn.Close()
+				return nil, err
+			}
+			if _, err = conn.Write(rawRequest); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("failed to write request: %w", err)
+			}
+			resp, parseErr = parseRawResponse(conn)
+			if parseErr != nil {
+				conn.Close()
+				return nil, parseErr
+			}
+		} else {
+			return nil, parseErr
+		}
+	}
+	resp.Duration = time.Since(start)
+
+	// Return connection to pool when keep-alive is possible and the body
+	// was fully consumed. If the body was truncated we must not reuse the
+	// connection because unread bytes will remain on the socket and will
+	// corrupt the next response parsing.
+	if proxyAddr == "" && responseAllowsKeepalive(strings.HasPrefix(resp.Headers, "HTTP/1.0"), resp.HeaderMap) && resp.BodyComplete {
+		DefaultPool.Put(poolKey, u.Scheme, conn)
+	} else {
+		conn.Close()
+	}
+
+	return resp, nil
+}
+
+// ─── Dial helpers ─────────────────────────────────────────────────────────────
+
+func dialNew(ctx context.Context, scheme, address, host, proxyAddr string, proxyIsHTTP bool, timeout time.Duration, insecure bool, allowPrivateTargets bool) (net.Conn, error) {
+	if scheme == "https" {
+		return dialHTTPS(ctx, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
+	}
+	return dialHTTP(ctx, address, proxyAddr, proxyIsHTTP, timeout, allowPrivateTargets)
+}
+
+func dialHTTPS(ctx context.Context, address, host, proxyAddr string, proxyIsHTTP bool, timeout time.Duration, insecure bool, allowPrivateTargets bool) (net.Conn, error) {
+	ciphers := []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	}
+	rand.Shuffle(len(ciphers), func(i, j int) { ciphers[i], ciphers[j] = ciphers[j], ciphers[i] })
+
+	tlsCfg := &tls.Config{
+		ServerName:         host,
+		InsecureSkipVerify: insecure,
+		CipherSuites:       ciphers,
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS13,
+	}
+
+	if proxyAddr == "" {
+		rawConn, err := dialContextResolved(ctx, "tcp", address, timeout, allowPrivateTargets, nil)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+
+	if proxyIsHTTP {
+		rawConn, err := dialHTTPProxy(ctx, proxyAddr, address, timeout)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("TLS handshake through HTTP proxy failed: %w", err)
+		}
+		return tlsConn, nil
+	}
+
+	// SOCKS5 proxy.
+	auth, proxyURL := parseSocks5Proxy(proxyAddr)
+	d, err := proxy.SOCKS5("tcp", proxyURL, auth, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("proxy init failed: %w", err)
+	}
+	rawConn, err := d.Dial("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dial failed: %w", err)
+	}
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("TLS handshake through SOCKS5 proxy failed: %w", err)
+	}
+	return tlsConn, nil
+}
+
+func dialHTTP(ctx context.Context, address, proxyAddr string, proxyIsHTTP bool, timeout time.Duration, allowPrivateTargets bool) (net.Conn, error) {
+	if proxyAddr == "" {
+		return dialContextResolved(ctx, "tcp", address, timeout, allowPrivateTargets, func(network, address string, c syscall.RawConn) error {
+			return setSocketLinger(c)
+		})
+	}
+
+	if proxyIsHTTP {
+		return dialPlainHTTPProxy(ctx, proxyAddr, timeout)
+	}
+
+	auth, proxyURL := parseSocks5Proxy(proxyAddr)
+	d, err := proxy.SOCKS5("tcp", proxyURL, auth, proxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("proxy init failed: %w", err)
+	}
+	return d.Dial("tcp", address)
+}
+
+// NewTransport builds a standard HTTP transport with the same dial-time
+// private-address enforcement used by the raw client.
+func NewTransport(timeout time.Duration, insecure bool, allowPrivateTargets bool) *http.Transport {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecure},
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialContextResolved(ctx, network, address, timeout, allowPrivateTargets, nil)
+		},
+	}
+}
+
+func validateDialAddress(ctx context.Context, network, address string, timeout time.Duration, allowPrivateTargets bool) error {
+	_, err := resolveDialAddress(ctx, network, address, timeout, allowPrivateTargets)
+	return err
+}
+
+func dialContextResolved(ctx context.Context, network, address string, timeout time.Duration, allowPrivateTargets bool, control func(network, address string, c syscall.RawConn) error) (net.Conn, error) {
+	resolvedAddress, err := resolveDialAddress(ctx, network, address, timeout, allowPrivateTargets)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{
+		Timeout: timeout,
+		Control: control,
+	}
+	return dialer.DialContext(ctx, network, resolvedAddress)
+}
+
+func resolveDialAddress(ctx context.Context, network, address string, timeout time.Duration, allowPrivateTargets bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", fmt.Errorf("invalid dial address %q: %w", address, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !allowPrivateTargets && netutil.IsPrivateIP(ip) {
+			return "", fmt.Errorf("SSRF protection: resolved target %q is private or loopback", ip.String())
+		}
+		return net.JoinHostPort(ip.String(), port), nil
+	}
+
+	lookupCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		lookupCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	addrs, err := lookupIPAddrContext(lookupCtx, host)
+	if err != nil {
+		return "", fmt.Errorf("DNS lookup failed for %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("DNS lookup returned no addresses for %q", host)
+	}
+	for _, addr := range addrs {
+		if !allowPrivateTargets && netutil.IsPrivateIP(addr.IP) {
+			return "", fmt.Errorf("SSRF protection: resolved target %q is private or loopback", addr.IP.String())
+		}
+	}
+	return net.JoinHostPort(addrs[0].IP.String(), port), nil
+}
+
+func dialPlainHTTPProxy(ctx context.Context, proxyAddr string, timeout time.Duration) (net.Conn, error) {
+	proxyURL, err := parseHTTPProxyURL(proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	proxyHost := proxyURL.Host
+	if !strings.Contains(proxyHost, ":") {
+		proxyHost += ":3128"
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyHost)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP proxy dial failed: %w", err)
+	}
+	return conn, nil
+}
+
+func parseHTTPProxyURL(proxyAddr string) (*url.URL, error) {
+	proxyURL, err := url.Parse(proxyAddr)
+	if err != nil || proxyURL.Host == "" {
+		proxyURL, err = url.Parse("http://" + proxyAddr)
+		if err != nil || proxyURL.Host == "" {
+			return nil, fmt.Errorf("invalid HTTP proxy address %q", proxyAddr)
+		}
+	}
+	return proxyURL, nil
+}
+
+func rewriteHTTPProxyRequest(rawRequest []byte, targetURL *url.URL, proxyAddr string) []byte {
+	lineEnd := bytes.Index(rawRequest, []byte("\r\n"))
+	lineSepLen := 2
+	if lineEnd == -1 {
+		lineEnd = bytes.IndexByte(rawRequest, '\n')
+		lineSepLen = 1
+	}
+	if lineEnd == -1 {
+		return rawRequest
+	}
+
+	firstLine := string(rawRequest[:lineEnd])
+	parts := strings.SplitN(firstLine, " ", 3)
+	if len(parts) != 3 || strings.HasPrefix(parts[1], "http://") || strings.HasPrefix(parts[1], "https://") {
+		return maybeAddProxyAuthorization(rawRequest, proxyAddr)
+	}
+
+	reqTarget := parts[1]
+	if reqTarget == "" {
+		reqTarget = "/"
+	}
+	if !strings.HasPrefix(reqTarget, "/") && reqTarget != "*" {
+		reqTarget = "/" + reqTarget
+	}
+	if reqTarget != "*" {
+		reqTarget = targetURL.Scheme + "://" + targetURL.Host + reqTarget
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(rawRequest) + len(targetURL.Scheme) + len(targetURL.Host) + 4)
+	out.WriteString(parts[0])
+	out.WriteByte(' ')
+	out.WriteString(reqTarget)
+	out.WriteByte(' ')
+	out.WriteString(parts[2])
+	out.Write(rawRequest[lineEnd : lineEnd+lineSepLen])
+	out.Write(rawRequest[lineEnd+lineSepLen:])
+	return maybeAddProxyAuthorization(out.Bytes(), proxyAddr)
+}
+
+func maybeAddProxyAuthorization(rawRequest []byte, proxyAddr string) []byte {
+	proxyURL, err := parseHTTPProxyURL(proxyAddr)
+	if err != nil || proxyURL.User == nil {
+		return rawRequest
+	}
+
+	headerEnd := bytes.Index(rawRequest, []byte("\r\n\r\n"))
+	sep := []byte("\r\n\r\n")
+	if headerEnd == -1 {
+		headerEnd = bytes.Index(rawRequest, []byte("\n\n"))
+		sep = []byte("\n\n")
+	}
+	if headerEnd == -1 || bytes.Contains(bytes.ToLower(rawRequest[:headerEnd]), []byte("\nproxy-authorization:")) {
+		return rawRequest
+	}
+
+	u := proxyURL.User.Username()
+	p, _ := proxyURL.User.Password()
+	encoded := base64.StdEncoding.EncodeToString([]byte(u + ":" + p))
+	header := []byte("Proxy-Authorization: Basic " + encoded)
+	if bytes.Equal(sep, []byte("\r\n\r\n")) {
+		header = append(header, []byte("\r\n")...)
+	} else {
+		header = append(header, '\n')
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(rawRequest) + len(header))
+	out.Write(rawRequest[:headerEnd+len(sep)])
+	out.Truncate(out.Len() - len(sep))
+	out.Write(header)
+	out.Write(sep)
+	out.Write(rawRequest[headerEnd+len(sep):])
+	return out.Bytes()
+}
+
+// dialHTTPProxy dials an HTTP proxy and sends a CONNECT request to tunnel to
+// the given target address (host:port).
+func dialHTTPProxy(ctx context.Context, proxyAddr, targetAddr string, timeout time.Duration) (net.Conn, error) {
+	proxyURL, err := parseHTTPProxyURL(proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	proxyHost := proxyURL.Host
+	if !strings.Contains(proxyHost, ":") {
+		proxyHost += ":3128"
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyHost)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP proxy dial failed: %w", err)
+	}
+
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
+	if proxyURL.User != nil {
+		u := proxyURL.User.Username()
+		p, _ := proxyURL.User.Password()
+		encoded := base64.StdEncoding.EncodeToString([]byte(u + ":" + p))
+		connectReq += "Proxy-Authorization: Basic " + encoded + "\r\n"
+	}
+	connectReq += "\r\n"
+
+	conn.SetDeadline(time.Now().Add(timeout))
+	if _, err = conn.Write([]byte(connectReq)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP proxy CONNECT write failed: %w", err)
+	}
+
+	var respBytes []byte
+	buf := make([]byte, 1024)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			respBytes = append(respBytes, buf[:n]...)
+			if bytes.Contains(respBytes, []byte("\r\n\r\n")) || bytes.Contains(respBytes, []byte("\n\n")) {
+				break
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			conn.Close()
+			return nil, fmt.Errorf("HTTP proxy CONNECT response read failed: %w", err)
+		}
+	}
+
+	respStr := string(respBytes)
+	firstLineEnd := strings.Index(respStr, "\n")
+	if firstLineEnd == -1 {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP proxy CONNECT failed: invalid response")
+	}
+
+	firstLine := strings.TrimSpace(respStr[:firstLineEnd])
+	parts := strings.SplitN(firstLine, " ", 3)
+	if len(parts) < 2 || parts[1] != "200" {
+		conn.Close()
+		return nil, fmt.Errorf("HTTP proxy CONNECT refused: %s", firstLine)
+	}
+
+	return conn, nil
+}
+
+// parseSocks5Proxy extracts optional auth and the clean host:port from a proxy
+// string that may or may not have a socks5:// scheme or user:pass@ prefix.
+func parseSocks5Proxy(proxyAddr string) (auth *proxy.Auth, cleanAddr string) {
+	proxyAddr = strings.TrimPrefix(proxyAddr, "socks5://")
+	if strings.Contains(proxyAddr, "@") {
+		at := strings.LastIndex(proxyAddr, "@")
+		if at > 0 {
+			creds := proxyAddr[:at]
+			addr := proxyAddr[at+1:]
+			if strings.Contains(creds, ":") && addr != "" {
+				authParts := strings.SplitN(creds, ":", 2)
+				auth = &proxy.Auth{User: authParts[0], Password: authParts[1]}
+				proxyAddr = addr
+			}
+		}
+	}
+	return auth, proxyAddr
+}
+
+// ─── Response parsing ─────────────────────────────────────────────────────────
+
+// dechunkBody decodes an HTTP/1.1 chunked body and returns the dechunked
+// payload plus any trailer headers found after the terminating 0 chunk.
+// If the input does not appear to be chunked (parsing fails before any
+// data is dechunked) the original body is returned and the trailer map is
+// nil.
+func dechunkBody(body []byte) ([]byte, map[string]string) {
+	var dechunked bytes.Buffer
+	// Use a reader wrapper to avoid copying the entire body into a new
+	// buffer. bytes.NewReader is lightweight; bufio.Reader provides
+	// ReadString used below.
+	buf := bufio.NewReader(bytes.NewReader(body))
+	for {
+		line, err := buf.ReadString('\n')
+		if err != nil {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if idx := strings.IndexByte(line, ';'); idx != -1 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		chunkSize, err := strconv.ParseInt(line, 16, 64)
+		if err != nil || chunkSize < 0 {
+			if dechunked.Len() == 0 {
+				return body, nil
+			}
+			break
+		}
+		if chunkSize == 0 {
+			// Final chunk — read optional trailer headers until an empty line.
+			trailers := make(map[string]string)
+			lastKey := ""
+			for {
+				tline, terr := buf.ReadString('\n')
+				if terr != nil && terr != io.EOF {
+					break
+				}
+				trimmed := strings.TrimRight(tline, "\r\n")
+				if trimmed == "" {
+					// End of trailers
+					break
+				}
+				// Continuation line (obsolete folding)
+				if len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t') {
+					if lastKey != "" {
+						trailers[lastKey] = trailers[lastKey] + " " + strings.TrimSpace(trimmed)
+					}
+					continue
+				}
+				parts := strings.SplitN(trimmed, ":", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				k := strings.ToLower(strings.TrimSpace(parts[0]))
+				v := strings.TrimSpace(parts[1])
+				trailers[k] = v
+				lastKey = k
+			}
+			return dechunked.Bytes(), trailers
+		}
+		remaining := MaxBodySize - dechunked.Len()
+		if remaining <= 0 {
+			_, _ = io.CopyN(io.Discard, buf, chunkSize)
+			buf.ReadString('\n')
+			break
+		}
+
+		toRead := chunkSize
+		if toRead > int64(remaining) {
+			toRead = int64(remaining)
+		}
+
+		const chunkReadBufSize = 32 * 1024
+		readBufSize := int64(chunkReadBufSize)
+		if toRead < readBufSize {
+			readBufSize = toRead
+		}
+		tmp := make([]byte, int(readBufSize))
+		var readTotal int64
+		for readTotal < toRead {
+			want := int64(len(tmp))
+			if remainingChunk := toRead - readTotal; remainingChunk < want {
+				want = remainingChunk
+			}
+			n, readErr := io.ReadFull(buf, tmp[:int(want)])
+			if n > 0 {
+				dechunked.Write(tmp[:n])
+				readTotal += int64(n)
+			}
+			if readErr != nil {
+				break
+			}
+		}
+
+		if chunkSize > toRead {
+			_, _ = io.CopyN(io.Discard, buf, chunkSize-toRead)
+		}
+		// Consume the trailing CRLF after the chunk data.
+		buf.ReadString('\n')
+	}
+	if dechunked.Len() > 0 {
+		return dechunked.Bytes(), nil
+	}
+	return body, nil
+}
+
+func decompressGzip(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	decompressed, err := io.ReadAll(io.LimitReader(reader, MaxBodySize))
+	if err != nil && err != io.ErrUnexpectedEOF {
+		if len(decompressed) == 0 {
+			return nil, err
+		}
+	}
+	return decompressed, nil
+}
+
+// decompressDeflate attempts to decode a "deflate" compressed body. Some
+// servers emit raw DEFLATE (RFC 1951) while others use zlib-wrapped
+// deflate (RFC 1950) but both are commonly labelled "deflate". Try zlib
+// first and fall back to raw inflate if that fails.
+func decompressDeflate(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	// Try zlib-wrapped (RFC 1950).
+	if zr, err := zlib.NewReader(bytes.NewReader(body)); err == nil {
+		defer zr.Close()
+		out, err := io.ReadAll(io.LimitReader(zr, MaxBodySize))
+		if err == nil || (err == io.ErrUnexpectedEOF && len(out) > 0) {
+			return out, nil
+		}
+	}
+	// Try raw DEFLATE (RFC 1951).
+	fr := flate.NewReader(bytes.NewReader(body))
+	if fr != nil {
+		defer fr.Close()
+		out, err := io.ReadAll(io.LimitReader(fr, MaxBodySize))
+		if err == nil || (err == io.ErrUnexpectedEOF && len(out) > 0) {
+			return out, nil
+		}
+	}
+	return nil, fmt.Errorf("deflate decompression failed")
+}
+
+func decompressBrotli(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	r := brotli.NewReader(bytes.NewReader(body))
+	return io.ReadAll(io.LimitReader(r, MaxBodySize))
+}
+
+func hasCompleteChunkedBody(body []byte) bool {
+	return hasCompleteChunkedBodyWithEOL(body, []byte("\r\n")) || hasCompleteChunkedBodyWithEOL(body, []byte("\n"))
+}
+
+func hasCompleteChunkedBodyWithEOL(body, eol []byte) bool {
+	zeroPrefix := append([]byte("0"), eol...)
+	zeroAfterLine := append(append([]byte{}, eol...), zeroPrefix...)
+	endOfTrailers := append(append([]byte{}, eol...), eol...)
+
+	zeroChunkStarts := make([]int, 0, 2)
+	if bytes.HasPrefix(body, zeroPrefix) {
+		zeroChunkStarts = append(zeroChunkStarts, 0)
+	}
+	searchFrom := 0
+	for {
+		idx := bytes.Index(body[searchFrom:], zeroAfterLine)
+		if idx == -1 {
+			break
+		}
+		zeroChunkStarts = append(zeroChunkStarts, searchFrom+idx+len(eol))
+		searchFrom += idx + 1
+	}
+
+	for _, start := range zeroChunkStarts {
+		rest := body[start+len(zeroPrefix):]
+		// No trailers: `0<eol><eol>`
+		if bytes.HasPrefix(rest, eol) {
+			return true
+		}
+		// With trailers: `0<eol>...<eol><eol>`
+		if bytes.Contains(rest, endOfTrailers) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseRawResponse(conn net.Conn) (*RawResponse, error) {
+	var buf bytes.Buffer
+	chunk := make([]byte, 4096)
+	headerParsed := false
+	headerEndIdx := -1
+	sepLen := 4
+	contentLength := -1
+	isChunked := false
+	// protoIsHTTP10 is set when the status line indicates HTTP/1.0. We use
+	// this later to recognise HTTP/1.0 responses that terminate the body by
+	// closing the connection (io.EOF) when there's no Content-Length.
+	protoIsHTTP10 := false
+	var headerMap map[string]string
+	var lastErr error
+
+	for {
+		n, err := conn.Read(chunk)
+		lastErr = err
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+		rawBytes := buf.Bytes()
+
+		if !headerParsed {
+			// Avoid rescanning the entire buffer on each read: compute the
+			// previous buffer length (before this read) and only search from a
+			// small overlap before the appended data. This makes the search
+			// linear in the amount of data received rather than quadratic.
+			prevLen := len(rawBytes) - n
+			if prevLen < 0 {
+				prevLen = 0
+			}
+			start := prevLen - 4
+			if start < 0 {
+				start = 0
+			}
+
+			if idx := bytes.Index(rawBytes[start:], []byte("\r\n\r\n")); idx != -1 {
+				headerEndIdx = start + idx
+				sepLen = 4
+				headerParsed = true
+			} else if idx := bytes.Index(rawBytes[start:], []byte("\n\n")); idx != -1 {
+				headerEndIdx = start + idx
+				sepLen = 2
+				headerParsed = true
+			}
+
+			if headerParsed {
+				headersStr := string(rawBytes[:headerEndIdx])
+				// Normalize line endings and build a header map (lowercased keys).
+				normalized := strings.ReplaceAll(headersStr, "\r\n", "\n")
+				normalized = strings.ReplaceAll(normalized, "\r", "\n")
+				lines := strings.Split(normalized, "\n")
+				headerMap = make(map[string]string)
+				// Detect HTTP version from the status line (first line).
+				if len(lines) > 0 {
+					firstLine := strings.TrimSpace(lines[0])
+					if strings.HasPrefix(strings.ToUpper(firstLine), "HTTP/1.0") {
+						protoIsHTTP10 = true
+					}
+				}
+				// Support obsolete header folding: continuation lines start
+				// with a space or tab and should be appended to the previous
+				// header's value. For Transfer-Encoding duplicates, concatenate
+				// their values with commas so we preserve the full sequence.
+				lastKey := ""
+				for i, line := range lines {
+					if i == 0 || strings.TrimSpace(line) == "" {
+						// Skip status line and empty lines.
+						continue
+					}
+					// Continuation line for previous header (obsolete folding).
+					if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+						if lastKey != "" {
+							prev := headerMap[lastKey]
+							headerMap[lastKey] = prev + " " + strings.TrimSpace(line)
+						}
+						continue
+					}
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) != 2 {
+						continue
+					}
+					k := strings.ToLower(strings.TrimSpace(parts[0]))
+					v := strings.TrimSpace(parts[1])
+					if prev, exists := headerMap[k]; exists {
+						if k == "transfer-encoding" {
+							// Concatenate multiple Transfer-Encoding values.
+							if prev == "" {
+								headerMap[k] = v
+							} else if v != "" {
+								headerMap[k] = prev + ", " + v
+							}
+						}
+						// otherwise: ignore duplicate header lines (preserve first)
+					} else {
+						headerMap[k] = v
+					}
+					lastKey = k
+				}
+				if te, ok := headerMap["transfer-encoding"]; ok && strings.Contains(strings.ToLower(te), "chunked") {
+					isChunked = true
+				} else if cl, ok := headerMap["content-length"]; ok {
+					if clv, err2 := strconv.Atoi(cl); err2 == nil {
+						contentLength = clv
+					}
+				}
+			}
+		}
+
+		if headerParsed {
+			bodyLen := buf.Len() - (headerEndIdx + sepLen)
+			if isChunked {
+				bodySoFar := rawBytes[headerEndIdx+sepLen:]
+				if hasCompleteChunkedBody(bodySoFar) {
+					break
+				}
+			} else if contentLength != -1 {
+				if bodyLen >= contentLength {
+					break
+				}
+			}
+		}
+
+		if err != nil {
+			break
+		}
+		if buf.Len() > MaxBodySize {
+			break
+		}
+	}
+
+	rawBytes := buf.Bytes()
+	if len(rawBytes) == 0 {
+		return nil, fmt.Errorf("empty response")
+	}
+
+	// Determine whether we actually consumed the entire body from the
+	// connection. This is required so callers know whether it's safe to
+	// return the underlying connection to a keep-alive pool.
+	bodyComplete := false
+	if headerEndIdx != -1 {
+		if isChunked {
+			bodySoFar := rawBytes[headerEndIdx+sepLen:]
+			if hasCompleteChunkedBody(bodySoFar) {
+				bodyComplete = true
+			}
+		} else if contentLength != -1 {
+			bodyLen := len(rawBytes) - (headerEndIdx + sepLen)
+			if bodyLen >= contentLength {
+				bodyComplete = true
+			}
+		}
+	}
+
+	// Special-case: HTTP/1.0 responses which signal the end of the body by
+	// closing the connection (io.EOF) and which do NOT provide a
+	// Content-Length or Transfer-Encoding. Treat an EOF in that case as a
+	// complete body so callers can compute metrics. We compute the final
+	// decision below after observing lastErr.
+	http10EOFBody := false
+	if headerEndIdx != -1 && protoIsHTTP10 && !isChunked && contentLength == -1 && lastErr == io.EOF {
+		http10EOFBody = true
+		bodyComplete = true
+	}
+
+	// If we broke out due to a read error (lastErr != nil) we should treat
+	// the body as incomplete for pooling purposes — except when the error
+	// is io.EOF for an HTTP/1.0 connection-close body (handled above).
+	if lastErr != nil {
+		if lastErr == io.EOF && http10EOFBody {
+			// keep bodyComplete = true
+		} else {
+			bodyComplete = false
+		}
+	}
+
+	resp := &RawResponse{Raw: rawBytes, BodyComplete: bodyComplete, HeaderMap: headerMap}
+	if headerEndIdx != -1 {
+		resp.Headers = string(rawBytes[:headerEndIdx])
+		resp.Body = rawBytes[headerEndIdx+sepLen:]
+	} else {
+		resp.Body = rawBytes
+	}
+
+	if len(resp.Body) > MaxBodySize {
+		resp.Body = resp.Body[:MaxBodySize]
+		resp.BodyComplete = false
+	}
+
+	firstLineEnd := strings.Index(resp.Headers, "\n")
+	if firstLineEnd != -1 {
+		firstLine := strings.TrimSpace(resp.Headers[:firstLineEnd])
+		parts := strings.SplitN(firstLine, " ", 3)
+		if len(parts) >= 2 {
+			if code, err := strconv.Atoi(parts[1]); err == nil {
+				resp.StatusCode = code
+			}
+		}
+	}
+
+	needsUpdate := false
+	if isChunked {
+		newBody, trailers := dechunkBody(resp.Body)
+		resp.Body = newBody
+		if len(trailers) > 0 {
+			if resp.HeaderMap == nil {
+				resp.HeaderMap = make(map[string]string)
+			}
+			// Trailer headers take precedence over original headers.
+			for k, v := range trailers {
+				resp.HeaderMap[k] = v
+			}
+		}
+		needsUpdate = true
+	}
+
+	// Handle stacked Content-Encoding values. RFC lists the last encoding
+	// applied first, so we must process encodings in reverse order.
+	encHeader := strings.ToLower(strings.TrimSpace(resp.GetHeader("Content-Encoding")))
+	if encHeader != "" {
+		parts := strings.Split(encHeader, ",")
+		stop := false
+		for i := len(parts) - 1; i >= 0; i-- {
+			if stop {
+				break
+			}
+			enc := strings.ToLower(strings.TrimSpace(parts[i]))
+			switch enc {
+			case "gzip", "x-gzip":
+				if newBody, err := decompressGzip(resp.Body); err == nil {
+					resp.Body = newBody
+					needsUpdate = true
+				} else {
+					resp.BodyEncoded = true
+					stop = true
+				}
+			case "deflate", "x-deflate":
+				if newBody, err := decompressDeflate(resp.Body); err == nil {
+					resp.Body = newBody
+					needsUpdate = true
+				} else {
+					resp.BodyEncoded = true
+					stop = true
+				}
+			case "br", "brotli":
+				if newBody, err := decompressBrotli(resp.Body); err == nil {
+					resp.Body = newBody
+					needsUpdate = true
+				} else {
+					resp.BodyEncoded = true
+					stop = true
+				}
+			case "", "identity":
+				// No-op: identity means no encoding.
+			default:
+				// Unknown encoding — mark as encoded and stop.
+				resp.BodyEncoded = true
+				stop = true
+			}
+		}
+	}
+	if needsUpdate {
+		var newRaw bytes.Buffer
+		newRaw.WriteString(resp.Headers)
+		newRaw.WriteString("\r\n\r\n")
+		newRaw.Write(resp.Body)
+		resp.Raw = newRaw.Bytes()
+	}
+
+	return resp, nil
+}
