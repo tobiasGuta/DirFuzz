@@ -4880,11 +4880,29 @@ func formatResult(r engine.Result, authCycleIdx int) string {
 
 	rowStyle := anomalyRowStyle(r)
 	statusCode := r.StatusCode
+	size := r.Size
+	words := r.Words
+	lines := r.Lines
+	duration := r.Duration
+	contentType := r.ContentType
+	headers := r.Headers
+
 	roleIndicator := ""
 	if numRoles := len(r.AuthRoles); numRoles > 0 {
 		idx := authCycleIdx % numRoles
 		currentRole := r.AuthRoles[idx]
+		
 		statusCode = currentRole.StatusCode
+		// Use the role-specific metrics if they were captured (Size > 0 indicates it was captured)
+		if currentRole.Size > 0 || currentRole.Words > 0 || currentRole.Lines > 0 {
+			size = currentRole.Size
+			words = currentRole.Words
+			lines = currentRole.Lines
+			duration = currentRole.Duration
+			contentType = currentRole.ContentType
+			headers = currentRole.Headers
+		}
+		
 		roleStyle := lipgloss.NewStyle().Foreground(DraculaPurple)
 		roleIndicator = roleStyle.Render(fmt.Sprintf(" [Role: %s]", currentRole.Role))
 	}
@@ -4922,21 +4940,21 @@ func formatResult(r engine.Result, authCycleIdx int) string {
 	if r.Redirect != "" {
 		extras += mutedStyle.Render(fmt.Sprintf(" -> %s", r.Redirect))
 	}
-	if val, ok := r.Headers["Server"]; ok {
+	if val, ok := headers["Server"]; ok {
 		extras += mutedStyle.Render(fmt.Sprintf(" [Server: %s]", val))
 	}
-	if val, ok := r.Headers["X-Powered-By"]; ok {
+	if val, ok := headers["X-Powered-By"]; ok {
 		extras += mutedStyle.Render(fmt.Sprintf(" [X-Powered-By: %s]", val))
 	}
-	if r.ContentType != "" {
-		extras += mutedStyle.Render(fmt.Sprintf(" [%s]", r.ContentType))
+	if contentType != "" {
+		extras += mutedStyle.Render(fmt.Sprintf(" [%s]", contentType))
 	}
-	if r.Duration > 0 {
+	if duration > 0 {
 		durationStyle := mutedStyle
 		if hasLabel(r.Labels, "TIMING-ORACLE") {
 			durationStyle = lipgloss.NewStyle().Foreground(DraculaPink).Bold(true)
 		}
-		extras += durationStyle.Render(fmt.Sprintf(" [%s]", r.Duration.Round(time.Millisecond)))
+		extras += durationStyle.Render(fmt.Sprintf(" [%s]", duration.Round(time.Millisecond)))
 	}
 	if len(r.DiscoveredParams) > 0 {
 		extras += mutedStyle.Render(fmt.Sprintf(" [Params: %s]", strings.Join(r.DiscoveredParams, ",")))
@@ -4952,8 +4970,8 @@ func formatResult(r engine.Result, authCycleIdx int) string {
 		statusColor.Render(fmt.Sprintf("[%d]", statusCode)),
 		pinkStyle.Render(methodStr),
 		highlightStyle.Render(r.Path),
-		mutedStyle.Render(fmt.Sprintf("(Size:%d", r.Size)),
-		mutedStyle.Render(fmt.Sprintf("W:%d L:%d)", r.Words, r.Lines)),
+		mutedStyle.Render(fmt.Sprintf("(Size:%d", size)),
+		mutedStyle.Render(fmt.Sprintf("W:%d L:%d)", words, lines)),
 		extras,
 		roleIndicator,
 	))
@@ -5414,16 +5432,26 @@ func (m *Model) View() string {
 			graphPaneWidth = 20
 		}
 		
-		header := renderPaneHeader(requestPaneHeaderStyle, graphPaneWidth, "🕸  Discovery Graph")
-		separator := separatorStyle.Render(strings.Repeat("─", graphPaneWidth))
+		innerPaneWidth := m.width - 4
+		if innerPaneWidth < 16 {
+			innerPaneWidth = 16
+		}
+		
+		header := renderPaneHeader(requestPaneHeaderStyle, innerPaneWidth, "🕸  Discovery Graph")
+		separator := separatorStyle.Render(strings.Repeat("─", innerPaneWidth))
 		
 		graphContent := m.renderGraphView()
 		paddedContent := lipgloss.NewStyle().PaddingLeft(2).Render(graphContent)
 		
+		innerVpHeight := vpHeight - 4
+		if innerVpHeight < 3 {
+			innerVpHeight = 3
+		}
+		
 		// Create a temporary viewport just to clip/scroll the graph
-		vp := viewport.New(graphPaneWidth, vpHeight-2)
+		vp := viewport.New(innerPaneWidth, innerVpHeight)
 		vp.SetContent(paddedContent)
-		vp.YOffset = m.listScrollIdx // Use list scroll index for now
+		vp.SetYOffset(m.listScrollIdx) // Use list scroll index for now, securely clamped
 		
 		graphPane := paneStyle.Width(graphPaneWidth).Height(vpHeight - 2).Render(
 			lipgloss.JoinVertical(lipgloss.Top,

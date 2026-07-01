@@ -320,12 +320,18 @@ type Result struct {
 }
 
 type AuthRoleDetail struct {
-	Role          string `json:"role"`
-	StatusCode    int    `json:"status"`
-	Request       string `json:"request,omitempty"`
-	Response      string `json:"response,omitempty"`
-	RequestBytes  []byte `json:"-"`
-	ResponseBytes []byte `json:"-"`
+	Role          string            `json:"role"`
+	StatusCode    int               `json:"status"`
+	Size          int               `json:"length,omitempty"`
+	Words         int               `json:"words,omitempty"`
+	Lines         int               `json:"lines,omitempty"`
+	Duration      time.Duration     `json:"duration,omitempty"`
+	ContentType   string            `json:"content_type,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Request       string            `json:"request,omitempty"`
+	Response      string            `json:"response,omitempty"`
+	RequestBytes  []byte            `json:"-"`
+	ResponseBytes []byte            `json:"-"`
 }
 
 type previousScanEntry struct {

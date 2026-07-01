@@ -791,9 +791,24 @@ func (e *Engine) worker(id int) {
 				if ar.resp == nil {
 					continue
 				}
+				arSize, arWords, arLines, arContentType, _ := computeResponseMetrics(ar.resp, successfulMethod)
+				
+				arCapturedHeaders := make(map[string]string)
+				for lowerKey, mappedKey := range interesting {
+					if val, ok := ar.resp.HeaderMap[lowerKey]; ok {
+						arCapturedHeaders[mappedKey] = val
+					}
+				}
+				
 				dt := AuthRoleDetail{
 					Role:          ar.role,
 					StatusCode:    ar.resp.StatusCode,
+					Size:          arSize,
+					Words:         arWords,
+					Lines:         arLines,
+					Duration:      ar.resp.Duration,
+					ContentType:   arContentType,
+					Headers:       arCapturedHeaders,
 					RequestBytes:  append([]byte(nil), ar.rawRequest...),
 					ResponseBytes: append([]byte(nil), ar.resp.Raw...),
 				}
