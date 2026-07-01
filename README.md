@@ -61,6 +61,17 @@ Despite its OS-level architecture, the underlying HTTP engine retains all standa
 - Native Nuclei orchestrator subprocess integration (`--nuclei`).
 - Opt-in distributed execution via Swarm mode (`--swarm`).
 
+## Installation
+
+### Method 1: Quick Install (Go Developers)
+If you already have Go installed, you can install all three binaries directly to your system path:
+```bash
+go install github.com/tobiasare/dirfuzz/cmd/...@latest
+```
+
+### Method 2: Pre-compiled Binaries
+You can download pre-compiled archives (containing all three tools) for Linux, macOS, and Windows from the [Releases](https://github.com/tobiasare/dirfuzz/releases) page. Extract the archive and place the binaries in your system's PATH.
+
 ## Build
 
 Requirements: Go 1.24.2 or newer.
