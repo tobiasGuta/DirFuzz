@@ -6,29 +6,30 @@ DirFuzz has evolved from a high-performance web security fuzzer into a determini
 
 DirFuzz enforces a strict intelligence pipeline:
 
-```text
-HTTP Engine / Workers
-     |
-     v
-Discovery Graph (Evidence Extraction)
-     |
-     v
-Event Ledger (Immutable Source of Truth)
-     |
-     +-------------------------+
-     |                         |
-Knowledge Projection      Campaign Analytics
-     |                         |
-Decay Engine              Risk Engine
-     |                         |
-     +------------+------------+
-                  |
-                  v
-          Analyst Control Plane (TUI)
-                  |
-            Analyst Validation
-                  |
-            Engine Execution
+```mermaid
+flowchart TD
+    subgraph Data_Collection["Data Collection"]
+        A["HTTP Engine / Workers"] --> B["Discovery Graph<br>(Evidence Extraction)"]
+    end
+
+    subgraph Ledger["Source of Truth"]
+        C["Event Ledger<br>(Immutable Source of Truth)"]
+    end
+
+    subgraph Analysis["Intelligence & Analytics"]
+        D["Knowledge Projection"] --> F["Decay Engine"]
+        E["Campaign Analytics"] --> G["Risk Engine"]
+    end
+
+    subgraph Control_Plane["Analyst Control Plane"]
+        H["Analyst Control Plane (TUI)"] --> I["Analyst Validation"] --> J["Engine Execution"]
+    end
+
+    B --> C
+    C --> D
+    C --> E
+    F --> H
+    G --> H
 ```
 
 ### Key Architectural Pillars
