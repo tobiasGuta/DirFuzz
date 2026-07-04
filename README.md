@@ -8,28 +8,108 @@ DirFuzz enforces a strict intelligence pipeline:
 
 ```mermaid
 flowchart TD
-    subgraph Data_Collection["Data Collection"]
-        A["HTTP Engine / Workers"] --> B["Discovery Graph<br>(Evidence Extraction)"]
+    %% Theme-aware custom colors for node classes
+    classDef pipeline fill:#181825,stroke:#cba6f7,stroke-width:2px,color:#cdd6f4;
+    classDef worker fill:#181825,stroke:#a6e3a1,stroke-width:2px,color:#cdd6f4;
+    classDef ledger fill:#181825,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4;
+    classDef analyst fill:#181825,stroke:#fab387,stroke-width:2px,color:#cdd6f4;
+    classDef external fill:#181825,stroke:#f38ba8,stroke-width:2px,color:#cdd6f4;
+
+    %% 1. Reconnaissance Engine (Right Column, Vertical Flow)
+    subgraph ReconEngine["Reconnaissance Engine (Scan Pipeline)"]
+        A["1. CLI Launch / Autopilot"]:::pipeline
+        B["Target Scope Evaluation"]:::pipeline
+        C["Wordlist / Path Generation"]:::pipeline
+        D["HTTP Engine (Workers)"]:::pipeline
+        E["JS & OpenAPI Harvesting"]:::pipeline
+        F["Nuclei Subprocess Integration"]:::pipeline
+
+        A --> B --> C --> D --> E --> F
     end
 
-    subgraph Ledger["Source of Truth"]
-        C["Event Ledger<br>(Immutable Source of Truth)"]
+    %% 2. Swarm Worker Nodes (Bottom Right Column)
+    subgraph Workers["Worker Nodes (Swarm Mode)"]
+        W_Prov["Swarm Provider (Lambda/Local)"]:::worker
+        W1["Worker Node 1"]:::worker
+        W2["Worker Node 2"]:::worker
+        WN["Worker Node N"]:::worker
+        
+        W_Prov --> W1
+        W_Prov --> W2
+        W_Prov --> WN
     end
 
-    subgraph Analysis["Intelligence & Analytics"]
-        D["Knowledge Projection"] --> F["Decay Engine"]
-        E["Campaign Analytics"] --> G["Risk Engine"]
+    %% 3. Aggregator & Storage (Bottom Middle Column)
+    subgraph Storage["Immutable Storage & Analytics"]
+        Ledger[("Event Ledger<br>(results.jsonl)")]:::ledger
+        Decay["Decay Engine"]:::ledger
+        Risk["Risk Engine"]:::ledger
+        Playbooks["Playbook Grading"]:::ledger
+        DiffMemory["Diff Memory"]:::ledger
+        
+        Ledger --> Decay
+        Ledger --> Risk
+        Ledger --> Playbooks
+        Ledger --> DiffMemory
     end
 
-    subgraph Control_Plane["Analyst Control Plane"]
-        H["Analyst Control Plane (TUI)"] --> I["Analyst Validation"] --> J["Engine Execution"]
+    %% 4. TUI Analyst Control Plane (Bottom Left Column)
+    subgraph ControlPlane["Analyst Control Plane (TUI)"]
+        TUI["TUI Dashboard (dirfuzz)"]:::analyst
+        TUI_Triage["Triage & Mark Validation"]:::analyst
+        TUI_Repeater["Repeater Sessions"]:::analyst
+        TUI_Diff["Split-Screen Diffing"]:::analyst
+        
+        TUI --> TUI_Triage
+        TUI --> TUI_Repeater
+        TUI --> TUI_Diff
     end
 
-    B --> C
-    C --> D
-    C --> E
-    F --> H
-    G --> H
+    %% 5. External Connectors & Notifications (Far Left Column)
+    subgraph External["External Integrations"]
+        Monitor["Monitor Daemon (cmd/monitor)"]:::external
+        MCP["MCP Server (cmd/mcp)"]:::external
+        Webhooks["Discord / Slack Webhooks"]:::external
+        
+        Monitor --> Webhooks
+    end
+
+    %% Connecting the columns to replicate the topological layout of the user's diagram
+    
+    %% Recon Engine -> Swarm Workers
+    B -->|"2. Delegate Swarm Config"| W_Prov
+    
+    %% Worker Nodes -> Event Ledger
+    W1 -->|"3. Return SwarmWorkerResponse"| Ledger
+    W2 -->|"3. Return SwarmWorkerResponse"| Ledger
+    WN -->|"3. Return SwarmWorkerResponse"| Ledger
+    
+    %% Scan Pipeline -> Event Ledger
+    F -->|"4. Direct Event Append"| Ledger
+
+    %% Ledger Projections -> TUI and MCP
+    Decay -->|"5. Fetch Stats / Views"| TUI
+    Risk -->|"5. Fetch Stats / Views"| TUI
+    Playbooks -->|"5. Fetch Stats / Views"| TUI
+    DiffMemory -->|"5. Fetch Stats / Views"| TUI
+
+    Decay -->|"5. Expose Intelligence Graph"| MCP
+    Risk -->|"5. Expose Intelligence Graph"| MCP
+    Playbooks -->|"5. Expose Intelligence Graph"| MCP
+    DiffMemory -->|"5. Expose Intelligence Graph"| MCP
+    
+    %% Event Ledger -> Monitor
+    Ledger -.->|"6. Continuous Timeline Poll"| Monitor
+    
+    %% TUI triage loop back to execution
+    TUI_Triage -->|"7. ValidationCommand"| D
+
+    %% Custom Subgraph styling to match the color borders of the image
+    style ReconEngine fill:#1e1e2e,stroke:#cba6f7,stroke-width:2px,color:#cba6f7
+    style Workers fill:#1e1e2e,stroke:#a6e3a1,stroke-width:2px,color:#a6e3a1
+    style Storage fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px,color:#89b4fa
+    style ControlPlane fill:#1e1e2e,stroke:#fab387,stroke-width:2px,color:#fab387
+    style External fill:#1e1e2e,stroke:#f38ba8,stroke-width:2px,color:#f38ba8
 ```
 
 ### Key Architectural Pillars
