@@ -1,5 +1,7 @@
 # DirFuzz: Bug Bounty Intelligence OS
 
+https://github.com/user-attachments/assets/bbc39523-9785-4c56-ae14-0571501ab5b0
+
 DirFuzz has evolved from a high-performance web security fuzzer into a deterministic **Bug Bounty Intelligence Operating System**. It is built around an immutable Event Ledger, capable of projecting complex attack surface graphs, continuous regression tracking, playbook intelligence, and deterministic Analyst workflows.
 
 ## The Architecture
