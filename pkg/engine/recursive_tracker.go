@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"context"
 	"dirfuzz/pkg/httpclient"
 	"net/url"
 	"os"
@@ -55,50 +56,77 @@ func (t *engineRecursiveTracker) ProcessHit(job Job, result Result, resp *httpcl
 	}
 
 	if inScope {
-		go func(runID int64, basePath string, nextDepth int, wlPath string) {
-			if t.e.checkRecursiveWildcard(basePath) {
-				return
-			}
+		sc := t.e.scannerCtx.Load()
+		if sc == nil {
+			return false
+		}
 
-			select {
-			case t.sem <- struct{}{}:
-				t.e.AddScanner()
-				go func(runID int64, basePath string, nextDepth int, wlPath string) {
-					defer t.e.scannerWg.Done()
-					defer func() { <-t.sem }()
+		// Reserve active work while the parent job is still counted. This keeps
+		// Wait correct even if its initial scanner wait completed just before
+		// this worker discovered the recursive branch.
+		t.e.activeJobs.Add(1)
 
-					snap := t.e.configSnap.Load()
-					if snap == nil {
-						return
-					}
-
-					f, err := os.Open(wlPath)
-					if err != nil {
-						return
-					}
-					defer f.Close()
-
-					scanner := bufio.NewScanner(f)
-					for scanner.Scan() {
-						word := scanner.Text()
-						if word == "" {
-							continue
-						}
-						newPath := strings.TrimSuffix(basePath, "/") + "/" + strings.TrimPrefix(word, "/")
-						if pathExcludedByRegexps(newPath, snap.ExcludePathRegexps) {
-							continue
-						}
-						for _, method := range resolveMethodsForPath(newPath, snap.Methods, snap.SmartAPI) {
-							atomic.AddInt64(&t.e.TotalLines, 1)
-							t.e.Submit(Job{Path: newPath, Depth: nextDepth, Method: method, RunID: runID})
-						}
-					}
-				}(runID, basePath, nextDepth, wlPath)
-			default:
-			}
-		}(job.RunID, payload, depth+1, wordlistPath)
+		// Register before launching so scanner cancellation and wordlist changes
+		// wait for the complete task, including its wildcard probe.
+		t.e.AddScanner()
+		go t.scanBranch(sc.ctx, job.RunID, payload, depth+1, wordlistPath)
 	}
 	return false
+}
+
+func (t *engineRecursiveTracker) scanBranch(ctx context.Context, runID int64, basePath string, nextDepth int, wordlistPath string) {
+	defer t.e.scannerWg.Done()
+	defer t.e.activeJobs.Done()
+
+	// Admission covers both the wildcard probe and wordlist enumeration.
+	// A busy recursion pool delays work instead of silently discarding it.
+	select {
+	case t.sem <- struct{}{}:
+		defer func() { <-t.sem }()
+	case <-ctx.Done():
+		return
+	}
+
+	if t.e.checkRecursiveWildcard(ctx, basePath) {
+		return
+	}
+
+	snap := t.e.configSnap.Load()
+	if snap == nil {
+		return
+	}
+
+	f, err := os.Open(wordlistPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		word := strings.TrimRight(scanner.Text(), "\r")
+		if word == "" {
+			continue
+		}
+
+		paths := wordlistPathVariants(basePath, word, snap.Extensions)
+		methods := resolveMethodsForPath(paths[0], snap.Methods, snap.SmartAPI)
+		for _, method := range methods {
+			for _, path := range paths {
+				if pathExcludedByRegexps(path, snap.ExcludePathRegexps) {
+					continue
+				}
+				atomic.AddInt64(&t.e.TotalLines, 1)
+				t.e.Submit(Job{Path: path, Depth: nextDepth, Method: method, RunID: runID})
+			}
+		}
+	}
 }
 
 func (t *engineRecursiveTracker) Clear() {

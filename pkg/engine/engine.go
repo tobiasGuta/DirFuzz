@@ -39,6 +39,30 @@ type smartProxy struct {
 	failCount     int
 }
 
+type workerControl struct {
+	cancel context.CancelFunc
+}
+
+// autoFilterFingerprint identifies one repetitive response family without
+// broadening an automatic decision into a global size-only filter.
+type autoFilterFingerprint struct {
+	StatusCode       int
+	ContentType      string
+	BodyHash         uint64
+	BodySize         int
+	Forbidden403Type string
+}
+
+func makeAutoFilterFingerprint(statusCode, bodySize int, contentType string, bodyHash uint64, forbidden403Type string) autoFilterFingerprint {
+	return autoFilterFingerprint{
+		StatusCode:       statusCode,
+		ContentType:      strings.ToLower(strings.TrimSpace(contentType)),
+		BodyHash:         bodyHash,
+		BodySize:         bodySize,
+		Forbidden403Type: forbidden403Type,
+	}
+}
+
 // ─── Log events ───────────────────────────────────────────────────────────────
 
 type LogLevel string
@@ -103,79 +127,79 @@ type SizeRange struct {
 // Config holds all runtime configuration for the engine.
 type Config struct {
 	sync.RWMutex
-	UserAgent            string
-	Headers              map[string]string
-	MatchCodes           map[int]bool
-	FilterSizes          map[int]bool
-	FilterSizeRanges     []SizeRange // NEW: filter responses whose size falls in any of these ranges
-	MatchContentTypes    []string    // NEW: only surface responses whose Content-Type contains one of these strings
-	FilterContentTypes   []string    // NEW: discard responses whose Content-Type contains any of these strings
-	MatchRegex           string
-	FilterRegex          string
-	ExcludePathPatterns  []string
-	Extensions           []string
-	Methods              []string
-	AuthMatrix           map[string][]string
-	SmartAPI             bool
-	Mutate               bool
-	Recursive            bool
-	RecursivePrune       bool
-	MaxDepth             int
-	IsPaused             bool
-	Delay                time.Duration
-	MaxWorkers           int
-	FollowRedirects      bool
-	MaxRedirects         int
-	AllowPrivateTargets  bool
-	RequestBody          string
-	FilterWords          int
-	FilterLines          int
-	MatchWords           int
-	MatchLines           int
-	OutputFormat         string
-	FilterRTMin          time.Duration
-	FilterRTMax          time.Duration
-	ProxyOut             string
-	OOBEnabled           bool
-	InteractshServer     string
-	InteractshToken      string
-	WordlistPath         string
-	Nuclei               bool
-	NucleiArgs           string
-	OutputFile           string
-	Timeout              time.Duration
-	Insecure             bool
-	AntiBotFallback      bool
-	AutoFilterThreshold  int
-	SimhashThreshold     int
-	SimhashClusterLimit  int
+	UserAgent                 string
+	Headers                   map[string]string
+	MatchCodes                map[int]bool
+	FilterSizes               map[int]bool
+	FilterSizeRanges          []SizeRange // NEW: filter responses whose size falls in any of these ranges
+	MatchContentTypes         []string    // NEW: only surface responses whose Content-Type contains one of these strings
+	FilterContentTypes        []string    // NEW: discard responses whose Content-Type contains any of these strings
+	MatchRegex                string
+	FilterRegex               string
+	ExcludePathPatterns       []string
+	Extensions                []string
+	Methods                   []string
+	AuthMatrix                map[string][]string
+	SmartAPI                  bool
+	Mutate                    bool
+	Recursive                 bool
+	RecursivePrune            bool
+	MaxDepth                  int
+	IsPaused                  bool
+	Delay                     time.Duration
+	MaxWorkers                int
+	FollowRedirects           bool
+	MaxRedirects              int
+	AllowPrivateTargets       bool
+	RequestBody               string
+	FilterWords               int
+	FilterLines               int
+	MatchWords                int
+	MatchLines                int
+	OutputFormat              string
+	FilterRTMin               time.Duration
+	FilterRTMax               time.Duration
+	ProxyOut                  string
+	OOBEnabled                bool
+	InteractshServer          string
+	InteractshToken           string
+	WordlistPath              string
+	Nuclei                    bool
+	NucleiArgs                string
+	OutputFile                string
+	Timeout                   time.Duration
+	Insecure                  bool
+	AntiBotFallback           bool
+	AutoFilterThreshold       int
+	SimhashThreshold          int
+	SimhashClusterLimit       int
 	DisableSoft404Calibration bool
-	H2Mode               bool
-	H2ConcurrentStreams  int
-	TimingOracle         bool
-	TimeOracleK          float64
-	TimeOracleN          int
-	TimeTrim             bool
-	Harvest              bool
-	HarvestJS            bool
-	HarvestAPI           bool
-	HarvestResponse      bool
-	HarvestPassive       bool
-	HarvestSourceMaps    bool
-	HarvestResponseDepth int
-	HarvestResponseFetch int
-	HarvestOTXKey        string
-	ParamWordlist        []string
-	EvasionLimit         int
-	MaxRetries           int
-	SaveRaw              bool // NEW: include raw request/response bytes in Result
-	WAFEvasion           bool
-	VerbTamper           bool
-	FourOhThreeBypass    bool // retry 403s with path and header bypass techniques
-	Spidering            bool // NEW: dynamic HTML/JS scraping
-	WebhookURL           string
-	WebhookOnNew         bool
-	WebhookOnDrift       bool
+	H2Mode                    bool
+	H2ConcurrentStreams       int
+	TimingOracle              bool
+	TimeOracleK               float64
+	TimeOracleN               int
+	TimeTrim                  bool
+	Harvest                   bool
+	HarvestJS                 bool
+	HarvestAPI                bool
+	HarvestResponse           bool
+	HarvestPassive            bool
+	HarvestSourceMaps         bool
+	HarvestResponseDepth      int
+	HarvestResponseFetch      int
+	HarvestOTXKey             string
+	ParamWordlist             []string
+	EvasionLimit              int
+	MaxRetries                int
+	SaveRaw                   bool // NEW: include raw request/response bytes in Result
+	WAFEvasion                bool
+	VerbTamper                bool
+	FourOhThreeBypass         bool // retry 403s with path and header bypass techniques
+	Spidering                 bool // NEW: dynamic HTML/JS scraping
+	WebhookURL                string
+	WebhookOnNew              bool
+	WebhookOnDrift            bool
 }
 
 // configSnapshot is an immutable view of the frequently-read configuration
@@ -546,10 +570,10 @@ type Engine struct {
 	eagleLock     sync.RWMutex
 
 	// Proxy Rotation
-	proxiesLock  sync.Mutex
-	proxies      []smartProxy
-	proxyIndex   uint64
-	proxyDialer  bool
+	proxiesLock sync.Mutex
+	proxies     []smartProxy
+	proxyIndex  uint64
+	proxyDialer bool
 
 	// Rate Limiters (Per-Host)
 	limiters     map[string]*rate.Limiter
@@ -567,8 +591,8 @@ type Engine struct {
 	activeWorkers      atomic.Int64
 
 	// Worker management
-	workerLock   sync.Mutex
-	workerStopCh chan struct{}
+	workerLock     sync.Mutex
+	workerControls map[int]*workerControl
 
 	// Telemetry (Atomic counters)
 	Count200             int64
@@ -590,9 +614,7 @@ type Engine struct {
 
 	// Smart Filter State
 	fpMutex           sync.RWMutex
-	fpCounts          map[string]int
-	manualFilterSizes map[int]bool
-	autoFilterSizes   map[int]bool
+	fpCounts          map[autoFilterFingerprint]int
 	simhashTracker    *SimhashTracker
 	evasionAttempted  *ConcurrentMap[string, []string]
 	EvasionScoreboard *EvasionScoreboard
@@ -663,7 +685,7 @@ type Engine struct {
 	paramTasksWg    sync.WaitGroup
 	// Cached immutable config snapshot read by workers.
 	configSnap atomic.Pointer[configSnapshot]
-	
+
 	// Config snapshot debouncing state
 	configSnapMu    sync.Mutex
 	configSnapTimer *time.Timer
@@ -895,39 +917,37 @@ func NewEngine(numWorkers int, expectedItems uint, falsePositiveRate float64) *E
 		currentBurst:  burst,
 		fingerprinter: fingerprint.NewFingerprinter(),
 		Config: &Config{
-			UserAgent:           "DirFuzz/2.0",
-			Headers:             make(map[string]string),
-			MatchCodes:          make(map[int]bool),
-			FilterSizes:         make(map[int]bool),
-			IsPaused:            false,
-			Delay:               0,
-			MaxWorkers:          numWorkers,
-			MaxRedirects:        DefaultMaxRedirects,
-			FilterWords:         -1,
-			FilterLines:         -1,
-			MatchWords:          -1,
-			MatchLines:          -1,
-			OutputFormat:        DefaultOutputFormat,
-			Timeout:             DefaultHTTPTimeout,
-			Insecure:            false,
-			AntiBotFallback:     true,
-			AllowPrivateTargets: false,
-			RecursivePrune:      true,
-			AutoFilterThreshold: DefaultAutoFilterThreshold,
-			SimhashThreshold:    DefaultSimhashThreshold,
-			SimhashClusterLimit: DefaultSimhashClusterLimit,
+			UserAgent:                 "DirFuzz/2.0",
+			Headers:                   make(map[string]string),
+			MatchCodes:                make(map[int]bool),
+			FilterSizes:               make(map[int]bool),
+			IsPaused:                  false,
+			Delay:                     0,
+			MaxWorkers:                numWorkers,
+			MaxRedirects:              DefaultMaxRedirects,
+			FilterWords:               -1,
+			FilterLines:               -1,
+			MatchWords:                -1,
+			MatchLines:                -1,
+			OutputFormat:              DefaultOutputFormat,
+			Timeout:                   DefaultHTTPTimeout,
+			Insecure:                  false,
+			AntiBotFallback:           DefaultAntiBotFallback,
+			AllowPrivateTargets:       false,
+			RecursivePrune:            true,
+			AutoFilterThreshold:       DefaultAutoFilterThreshold,
+			SimhashThreshold:          DefaultSimhashThreshold,
+			SimhashClusterLimit:       DefaultSimhashClusterLimit,
 			DisableSoft404Calibration: flag.Lookup("test.v") != nil,
-			H2ConcurrentStreams: DefaultH2ConcurrentStreams,
-			TimeOracleK:         TimingOracleDefaultK,
-			TimeOracleN:         TimingOracleDefaultRepeatN,
-			EvasionLimit:        DefaultEvasionLimit,
+			H2ConcurrentStreams:       DefaultH2ConcurrentStreams,
+			TimeOracleK:               TimingOracleDefaultK,
+			TimeOracleN:               TimingOracleDefaultRepeatN,
+			EvasionLimit:              DefaultEvasionLimit,
 		},
 		Results:           make(chan Result, ResultsChannelSize),
 		LogEvents:         make(chan LogEvent, 5000),
 		antiBot:           newAntiBotManager(),
-		fpCounts:          make(map[string]int),
-		manualFilterSizes: make(map[int]bool),
-		autoFilterSizes:   make(map[int]bool),
+		fpCounts:          make(map[autoFilterFingerprint]int),
 		simhashTracker:    NewSimhashTracker(DefaultSimhashThreshold, DefaultSimhashClusterLimit),
 		EvasionScoreboard: NewEvasionScoreboard(),
 		lastTick:          time.Now().UnixNano(),
@@ -935,7 +955,7 @@ func NewEngine(numWorkers int, expectedItems uint, falsePositiveRate float64) *E
 		sourceMapSem:      make(chan struct{}, sourceMapConcurrency),
 		bypassSem:         make(chan struct{}, 20),
 		replayCh:          replayCh,
-		workerStopCh:      make(chan struct{}),
+		workerControls:    make(map[int]*workerControl),
 		DiscoveryGraph:    NewDiscoveryGraph(),
 		EvidenceExtractor: DefaultEvidenceExtractor{},
 	}
@@ -1057,8 +1077,8 @@ func (e *Engine) ReportProxyStatus(addr string, isBlocked bool) {
 				}
 				e.proxies[i].cooldownUntil = time.Now().Add(time.Duration(backoffSecs) * time.Second)
 				e.emitLogEvent(LogLevelWarning, LogCategoryNetwork, EventProxyRotated, fmt.Sprintf("proxy %s blocked, cooling down for %d seconds (fails: %d)", addr, backoffSecs, e.proxies[i].failCount), map[string]interface{}{
-					"proxy":     addr,
-					"cooldown":  backoffSecs,
+					"proxy":      addr,
+					"cooldown":   backoffSecs,
 					"fail_count": e.proxies[i].failCount,
 				})
 			} else {
@@ -1107,10 +1127,6 @@ drainLoop:
 		}
 	}
 
-	e.workerLock.Lock()
-	e.workerStopCh = make(chan struct{})
-	e.workerLock.Unlock()
-
 	e.shardedFilter = newShardedBloomFilter(bloomFilterShards, DefaultBloomFilterSize, DefaultBloomFilterFP)
 
 	atomic.StoreInt64(&e.ProcessedLines, 0)
@@ -1133,9 +1149,8 @@ drainLoop:
 	})
 
 	e.fpMutex.Lock()
-	e.fpCounts = make(map[string]int)
+	e.fpCounts = make(map[autoFilterFingerprint]int)
 	e.fpMutex.Unlock()
-	e.clearAutoFilterSizes()
 	e.simhashTracker.Clear()
 
 	atomic.StoreInt64(&e.AutoFilterSuppressed, 0)
@@ -1341,25 +1356,15 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 			copy(exts, snap.Extensions)
 		}
 
-		if pathExcludedByRegexps(line, snap.ExcludePathRegexps) {
-			continue
-		}
-
-		methodsToUse := resolveMethodsForPath(line, methods, smartAPI)
+		paths := wordlistPathVariants("", line, exts)
+		methodsToUse := resolveMethodsForPath(paths[0], methods, smartAPI)
 		for _, method := range methodsToUse {
-			// Increment total for this base path.
-			atomic.AddInt64(&e.TotalLines, 1)
-			e.Submit(Job{Path: line, Depth: 0, Method: method, RunID: runID})
-			for _, ext := range exts {
-				cleanExt := strings.TrimSpace(ext)
-				if !strings.HasPrefix(cleanExt, ".") {
-					cleanExt = "." + cleanExt
-				}
-				if pathExcludedByRegexps(line+cleanExt, snap.ExcludePathRegexps) {
+			for _, candidatePath := range paths {
+				if pathExcludedByRegexps(candidatePath, snap.ExcludePathRegexps) {
 					continue
 				}
 				atomic.AddInt64(&e.TotalLines, 1)
-				e.Submit(Job{Path: line + cleanExt, Depth: 0, Method: method, RunID: runID})
+				e.Submit(Job{Path: candidatePath, Depth: 0, Method: method, RunID: runID})
 			}
 		}
 	}
@@ -1373,6 +1378,29 @@ func (e *Engine) StartWordlistScanner(ctx context.Context, runID int64, path str
 		}
 		e.handleResultWithContext(ctx, res)
 	}
+}
+
+// wordlistPathVariants applies the same path joining and extension expansion
+// rules to root and recursive wordlist entries.
+func wordlistPathVariants(basePath, word string, extensions []string) []string {
+	path := word
+	if basePath != "" {
+		path = strings.TrimSuffix(basePath, "/") + "/" + strings.TrimPrefix(word, "/")
+	}
+
+	paths := make([]string, 0, 1+len(extensions))
+	paths = append(paths, path)
+	for _, ext := range extensions {
+		cleanExt := strings.TrimSpace(ext)
+		if cleanExt == "" {
+			continue
+		}
+		if !strings.HasPrefix(cleanExt, ".") {
+			cleanExt = "." + cleanExt
+		}
+		paths = append(paths, path+cleanExt)
+	}
+	return paths
 }
 
 // resolveMethodsForPath returns the HTTP methods to use for a given path,
@@ -1518,10 +1546,13 @@ func (e *Engine) Start() {
 	e.CalibrateSoft404()
 
 	for i := 0; i < e.numWorkers; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		control := &workerControl{cancel: cancel}
+		e.workerControls[i] = control
 		e.wg.Add(1)
 		e.activeWorkers.Add(1)
 		e.emitLogEvent(LogLevelInfo, LogCategoryWorker, EventWorkerStarted, fmt.Sprintf("worker %d started", i), map[string]interface{}{"worker_id": i})
-		go e.worker(i)
+		go e.worker(i, ctx, control)
 	}
 }
 
@@ -1541,27 +1572,21 @@ func (e *Engine) SetWorkerCount(n int) {
 		// Grow the pool
 		diff := n - e.numWorkers
 		for i := 0; i < diff; i++ {
+			ctx, cancel := context.WithCancel(context.Background())
+			control := &workerControl{cancel: cancel}
 			e.wg.Add(1)
 			e.activeWorkers.Add(1)
 			workerID := e.numWorkers + i
+			e.workerControls[workerID] = control
 			e.emitLogEvent(LogLevelInfo, LogCategoryWorker, EventWorkerStarted, fmt.Sprintf("worker %d started", workerID), map[string]interface{}{"worker_id": workerID, "new_size": n})
-			go e.worker(workerID)
+			go e.worker(workerID, ctx, control)
 		}
 	} else if n < e.numWorkers {
-		// Shrink the pool
-		diff := e.numWorkers - n
-		sc := e.scannerCtx.Load()
-		ctx := context.Background()
-		if sc != nil && sc.ctx != nil {
-			ctx = sc.ctx
-		}
-		for i := 0; i < diff; i++ {
-			go func() {
-				select {
-				case e.workerStopCh <- struct{}{}:
-				case <-ctx.Done():
-				}
-			}()
+		// Shrink the pool by cancelling the highest worker IDs explicitly.
+		for workerID := n; workerID < e.numWorkers; workerID++ {
+			if control := e.workerControls[workerID]; control != nil {
+				control.cancel()
+			}
 		}
 	}
 
@@ -1811,6 +1836,7 @@ func isSameSpiderScopeHost(baseHostname string, parsedLink *url.URL) bool {
 // applyFilters returns true when the result should be kept (not filtered).
 func (e *Engine) applyFilters(
 	resp *httpclient.RawResponse,
+	requestMethod string,
 	bodySize, wordCount, lineCount int,
 	bodyHash uint64,
 	contentType string,
@@ -1892,8 +1918,15 @@ func (e *Engine) applyFilters(
 			return false
 		}
 	}
-	// 9. SimHash soft-404 clustering.
-	if e.simhashTracker.IsSoftFour(bodyHash) {
+	// 9. SimHash soft-404 clustering. Only complete, decoded, non-empty
+	// response bodies produce a meaningful fingerprint. In particular, HEAD
+	// responses describe a representation without transferring its body.
+	simhashEligible := !strings.EqualFold(requestMethod, http.MethodHead) &&
+		len(resp.Body) > 0 &&
+		resp.BodyComplete &&
+		!resp.BodyEncoded &&
+		bodyHash != 0
+	if simhashEligible && e.simhashTracker.IsSoftFour(bodyHash) {
 		atomic.AddInt64(&e.SimhashSuppressed, 1)
 		e.emitLogEvent(LogLevelWarning, LogCategoryFilter, EventSimhashCluster, fmt.Sprintf("simhash cluster suppressed body hash %x", bodyHash), map[string]interface{}{
 			"body_hash": bodyHash,

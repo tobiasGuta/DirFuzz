@@ -40,9 +40,9 @@ type RawResponse struct {
 	Raw        []byte
 	Duration   time.Duration
 	// BodyComplete is true when the response body was fully read from the
-	// network (either by satisfying Content-Length or by seeing the final
-	// chunk terminator for chunked responses). When false the connection
-	// should not be returned to a keep-alive pool.
+	// network, or when the request method/status semantics prohibit a message
+	// body. When false the connection should not be returned to a keep-alive
+	// pool.
 	BodyComplete bool
 	// BodyEncoded indicates that the response body contains an encoding that
 	// this client cannot decode (e.g. Brotli / "br") or an attempted
@@ -260,6 +260,7 @@ func SendRawRequestWithContextPolicy(
 	allowPrivateTargets bool,
 ) (*RawResponse, error) {
 	start := time.Now()
+	expectNoBody := requestExpectsNoResponseBody(rawRequest)
 
 	u, err := url.Parse(targetURL)
 	if err != nil {
@@ -357,7 +358,7 @@ func SendRawRequestWithContextPolicy(
 	}
 
 	// Read the response.
-	resp, parseErr := parseRawResponse(conn)
+	resp, parseErr := parseRawResponse(conn, expectNoBody)
 	if parseErr != nil {
 		conn.Close()
 		// If we used a pooled connection and it failed on read, it might have been stale/half-closed by the server
@@ -377,7 +378,7 @@ func SendRawRequestWithContextPolicy(
 				conn.Close()
 				return nil, fmt.Errorf("failed to write request: %w", err)
 			}
-			resp, parseErr = parseRawResponse(conn)
+			resp, parseErr = parseRawResponse(conn, expectNoBody)
 			if parseErr != nil {
 				conn.Close()
 				return nil, parseErr
@@ -392,7 +393,7 @@ func SendRawRequestWithContextPolicy(
 	// was fully consumed. If the body was truncated we must not reuse the
 	// connection because unread bytes will remain on the socket and will
 	// corrupt the next response parsing.
-	if proxyAddr == "" && responseAllowsKeepalive(strings.HasPrefix(resp.Headers, "HTTP/1.0"), resp.HeaderMap) && resp.BodyComplete {
+	if proxyAddr == "" && resp.StatusCode >= http.StatusOK && responseAllowsKeepalive(strings.HasPrefix(resp.Headers, "HTTP/1.0"), resp.HeaderMap) && resp.BodyComplete {
 		DefaultPool.Put(poolKey, u.Scheme, conn)
 	} else {
 		conn.Close()
@@ -958,7 +959,23 @@ func hasCompleteChunkedBodyWithEOL(body, eol []byte) bool {
 	return false
 }
 
-func parseRawResponse(conn net.Conn) (*RawResponse, error) {
+func requestExpectsNoResponseBody(rawRequest []byte) bool {
+	lineEnd := bytes.IndexByte(rawRequest, '\n')
+	if lineEnd == -1 {
+		lineEnd = len(rawRequest)
+	}
+	fields := bytes.Fields(rawRequest[:lineEnd])
+	return len(fields) > 0 && bytes.EqualFold(fields[0], []byte(http.MethodHead))
+}
+
+func responseHasNoBody(expectNoBody bool, statusCode int) bool {
+	return expectNoBody ||
+		(statusCode >= 100 && statusCode < http.StatusOK) ||
+		statusCode == http.StatusNoContent ||
+		statusCode == http.StatusNotModified
+}
+
+func parseRawResponse(conn net.Conn, expectNoBody bool) (*RawResponse, error) {
 	var buf bytes.Buffer
 	chunk := make([]byte, 4096)
 	headerParsed := false
@@ -970,6 +987,7 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 	// this later to recognise HTTP/1.0 responses that terminate the body by
 	// closing the connection (io.EOF) when there's no Content-Length.
 	protoIsHTTP10 := false
+	statusCode := 0
 	var headerMap map[string]string
 	var lastErr error
 
@@ -1017,6 +1035,10 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 					firstLine := strings.TrimSpace(lines[0])
 					if strings.HasPrefix(strings.ToUpper(firstLine), "HTTP/1.0") {
 						protoIsHTTP10 = true
+					}
+					parts := strings.Fields(firstLine)
+					if len(parts) >= 2 {
+						statusCode, _ = strconv.Atoi(parts[1])
 					}
 				}
 				// Support obsolete header folding: continuation lines start
@@ -1069,6 +1091,9 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 		}
 
 		if headerParsed {
+			if responseHasNoBody(expectNoBody, statusCode) {
+				break
+			}
 			bodyLen := buf.Len() - (headerEndIdx + sepLen)
 			if isChunked {
 				bodySoFar := rawBytes[headerEndIdx+sepLen:]
@@ -1100,7 +1125,12 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 	// return the underlying connection to a keep-alive pool.
 	bodyComplete := false
 	if headerEndIdx != -1 {
-		if isChunked {
+		if responseHasNoBody(expectNoBody, statusCode) {
+			// A compliant no-body response ends at the header terminator. If
+			// extra bytes arrived in the same read, return promptly but do not
+			// reuse the connection because their framing is ambiguous.
+			bodyComplete = len(rawBytes) == headerEndIdx+sepLen
+		} else if isChunked {
 			bodySoFar := rawBytes[headerEndIdx+sepLen:]
 			if hasCompleteChunkedBody(bodySoFar) {
 				bodyComplete = true
@@ -1135,10 +1165,12 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 		}
 	}
 
-	resp := &RawResponse{Raw: rawBytes, BodyComplete: bodyComplete, HeaderMap: headerMap}
+	resp := &RawResponse{StatusCode: statusCode, Raw: rawBytes, BodyComplete: bodyComplete, HeaderMap: headerMap}
 	if headerEndIdx != -1 {
 		resp.Headers = string(rawBytes[:headerEndIdx])
-		resp.Body = rawBytes[headerEndIdx+sepLen:]
+		if !responseHasNoBody(expectNoBody, statusCode) {
+			resp.Body = rawBytes[headerEndIdx+sepLen:]
+		}
 	} else {
 		resp.Body = rawBytes
 	}
@@ -1146,17 +1178,6 @@ func parseRawResponse(conn net.Conn) (*RawResponse, error) {
 	if len(resp.Body) > MaxBodySize {
 		resp.Body = resp.Body[:MaxBodySize]
 		resp.BodyComplete = false
-	}
-
-	firstLineEnd := strings.Index(resp.Headers, "\n")
-	if firstLineEnd != -1 {
-		firstLine := strings.TrimSpace(resp.Headers[:firstLineEnd])
-		parts := strings.SplitN(firstLine, " ", 3)
-		if len(parts) >= 2 {
-			if code, err := strconv.Atoi(parts[1]); err == nil {
-				resp.StatusCode = code
-			}
-		}
 	}
 
 	needsUpdate := false

@@ -88,7 +88,7 @@ func parseFlags() cliConfig {
 	mutate := flag.Bool("mutate", false, "Append backup/swap suffixes to every hit (.bak, .old, ~, …)")
 	smartAPI := flag.Bool("smart-api", false, "Multi-method fuzzing only on API-style paths (/api/, /v1/, …)")
 	autoFilterThreshold := flag.Int("af", engine.DefaultAutoFilterThreshold,
-		"Auto-filter: suppress repeated same-size responses after N occurrences")
+		"Auto-filter: suppress repeated response fingerprints after N occurrences")
 	simhashThreshold := flag.Int("simhash-threshold", engine.DefaultSimhashThreshold,
 		"Soft-404 SimHash Hamming distance threshold")
 	simhashClusterLimit := flag.Int("simhash-cluster", engine.DefaultSimhashClusterLimit,
@@ -113,7 +113,7 @@ func parseFlags() cliConfig {
 	dryRun := flag.Bool("dry-run", false, "Estimate request volume and exit without sending traffic")
 	maxWSFrames := flag.Int("max-ws-frames", 5000, "Maximum number of WebSocket frames to store in memory")
 	fourOhThreeBypass := flag.Bool("bypass-403", false, "On every 403 hit, retry with path and header bypass techniques (X-Original-URL, dot-slash, url-encoding, …)")
-	antiBotFallback := flag.Bool("anti-bot-fallback", true, "Enable the headless browser anti-bot fallback when WAF or challenge responses are detected")
+	antiBotFallback := flag.Bool("anti-bot-fallback", engine.DefaultAntiBotFallback, "Explicitly enable the headless browser anti-bot fallback when WAF or challenge responses are detected")
 	swarm := flag.Bool("swarm", false, "Enable distributed worker mode for large authorized scans")
 	swarmProvider := flag.String("swarm-provider", "", "Swarm provider backend: local or lambda")
 	swarmNodes := flag.Int("swarm-nodes", 4, "Number of worker nodes to fan out across")

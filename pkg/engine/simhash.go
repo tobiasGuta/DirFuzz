@@ -94,17 +94,26 @@ type simhashCluster struct {
 type SimhashTracker struct {
 	clusters     []simhashCluster
 	clusterLock  sync.Mutex
-	Threshold    int
-	ClusterLimit int
+	threshold    int
+	clusterLimit int
 }
 
 // NewSimhashTracker creates a new SimhashTracker.
 func NewSimhashTracker(threshold, limit int) *SimhashTracker {
 	return &SimhashTracker{
 		clusters:     make([]simhashCluster, 0, 100),
-		Threshold:    threshold,
-		ClusterLimit: limit,
+		threshold:    threshold,
+		clusterLimit: limit,
 	}
+}
+
+// Configure updates clustering parameters under the same lock used by request
+// workers, preventing snapshot refreshes from racing with live scans.
+func (s *SimhashTracker) Configure(threshold, limit int) {
+	s.clusterLock.Lock()
+	s.threshold = threshold
+	s.clusterLimit = limit
+	s.clusterLock.Unlock()
 }
 
 // Clear resets the cluster map.
@@ -117,29 +126,29 @@ func (s *SimhashTracker) Clear() {
 // IsSoftFour tracks a SimHash cluster and returns true once the cluster
 // exceeds the configured limit.
 func (s *SimhashTracker) IsSoftFour(bodyHash uint64) bool {
-	threshold := s.Threshold
+	s.clusterLock.Lock()
+	defer s.clusterLock.Unlock()
+
+	threshold := s.threshold
 	if threshold < 0 {
 		threshold = 0
 	}
-	limit := s.ClusterLimit
+	limit := s.clusterLimit
 	if limit <= 0 {
 		return false
 	}
 
-	s.clusterLock.Lock()
-	defer s.clusterLock.Unlock()
-
 	for i := 0; i < len(s.clusters); i++ {
 		if hammingDistance(s.clusters[i].centroid, bodyHash) <= threshold {
 			s.clusters[i].count++
-			
+
 			// Bubble up to keep sorted descending by count
 			curr := i
 			for curr > 0 && s.clusters[curr].count > s.clusters[curr-1].count {
 				s.clusters[curr], s.clusters[curr-1] = s.clusters[curr-1], s.clusters[curr]
 				curr--
 			}
-			
+
 			return s.clusters[curr].count >= limit
 		}
 	}
@@ -151,7 +160,7 @@ func (s *SimhashTracker) IsSoftFour(bodyHash uint64) bool {
 	} else {
 		s.clusters = append(s.clusters, simhashCluster{centroid: bodyHash, count: 1})
 	}
-	
+
 	return false
 }
 
@@ -159,6 +168,6 @@ func (s *SimhashTracker) IsSoftFour(bodyHash uint64) bool {
 func (s *SimhashTracker) SeedBaseline(bodyHash uint64) {
 	s.clusterLock.Lock()
 	defer s.clusterLock.Unlock()
-	c := simhashCluster{centroid: bodyHash, count: s.ClusterLimit}
+	c := simhashCluster{centroid: bodyHash, count: s.clusterLimit}
 	s.clusters = append([]simhashCluster{c}, s.clusters...)
 }

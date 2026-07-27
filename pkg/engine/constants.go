@@ -11,6 +11,7 @@ const (
 // ─── Auto-Filter ─────────────────────────────────────────────────────────────
 const (
 	DefaultAutoFilterThreshold = 15
+	DefaultAntiBotFallback     = false
 )
 
 // ─── SimHash Soft-404 Clustering ─────────────────────────────────────────────

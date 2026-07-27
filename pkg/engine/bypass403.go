@@ -1,12 +1,15 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
+
+	"dirfuzz/pkg/httpclient"
 )
 
 type bypass403Technique struct {
@@ -78,7 +81,7 @@ func Run403Bypass(ctx context.Context, e *Engine, targetURL string, reqPath stri
 			continue
 		}
 
-		if !is403BypassSuccess(resp.StatusCode) {
+		if !isMeaningfulAccessImprovement(http.StatusForbidden, resp.StatusCode) {
 			continue
 		}
 		if baselineSize >= 0 && len(resp.Body) == baselineSize {
@@ -116,8 +119,12 @@ func (e *Engine) schedule403BypassTask(ctx context.Context, targetURL, reqPath, 
 	}
 	select {
 	case e.bypassSem <- struct{}{}:
+		// The parent job is still active here, so reserve lifecycle work before
+		// launching. Wait and Shutdown must include validation results.
+		e.activeJobs.Add(1)
 		go func() {
 			defer func() {
+				e.activeJobs.Done()
 				if r := recover(); r != nil {
 					e.emitLogEvent(LogLevelWarning, LogCategoryDiscovery, EventNetworkError, fmt.Sprintf("403 bypass task panicked: %v", r), map[string]interface{}{
 						"target": targetURL,
@@ -198,13 +205,26 @@ func build403BypassTechniques(reqPath string) []bypass403Technique {
 	return techniques
 }
 
-func is403BypassSuccess(status int) bool {
-	switch status {
-	case http.StatusOK, http.StatusCreated, http.StatusNoContent:
-		return true
-	default:
+func isMeaningfulAccessImprovement(originalStatus, candidateStatus int) bool {
+	originalBlocked := originalStatus == http.StatusUnauthorized || originalStatus == http.StatusForbidden
+	candidateGranted := candidateStatus >= http.StatusOK && candidateStatus < http.StatusMultipleChoices
+	return originalBlocked && candidateGranted
+}
+
+func isMeaningfulBypassResponse(original, candidate *httpclient.RawResponse) bool {
+	if original == nil || candidate == nil || !isMeaningfulAccessImprovement(original.StatusCode, candidate.StatusCode) {
 		return false
 	}
+	if len(original.Body) > 0 && len(original.Body) == len(candidate.Body) {
+		if bytes.Equal(original.Body, candidate.Body) {
+			return false
+		}
+		originalHash := simhashBody(original.Body)
+		if originalHash != 0 && originalHash == simhashBody(candidate.Body) {
+			return false
+		}
+	}
+	return true
 }
 
 func splitBypassPathQuery(reqPath string) (string, string) {

@@ -19,7 +19,7 @@ func (e *Engine) scheduleBuildSnapshot() {
 
 	e.configSnapMu.Lock()
 	defer e.configSnapMu.Unlock()
-	
+
 	if e.configSnapTimer != nil {
 		e.configSnapTimer.Stop()
 	}
@@ -146,8 +146,7 @@ func (e *Engine) buildAndStoreConfigSnapshot() {
 	copy(s.Extensions, e.Config.Extensions)
 	s.ParamWordlist = append(s.ParamWordlist, e.Config.ParamWordlist...)
 	e.Config.RUnlock()
-	e.simhashTracker.Threshold = s.SimhashThreshold
-	e.simhashTracker.ClusterLimit = s.SimhashClusterLimit
+	e.simhashTracker.Configure(s.SimhashThreshold, s.SimhashClusterLimit)
 
 	e.configSnap.Store(s)
 }
@@ -175,7 +174,6 @@ func (e *Engine) ConfigureFilters(mc []int, fs []int) {
 	}
 	for _, size := range fs {
 		e.Config.FilterSizes[size] = true
-		e.manualFilterSizes[size] = true
 	}
 	e.Config.Unlock()
 	e.scheduleBuildSnapshot()
@@ -300,18 +298,6 @@ func (e *Engine) ConfigSnapshot() (ua string, filters []int, headers map[string]
 func (e *Engine) AddFilterSize(size int) {
 	e.Config.Lock()
 	e.Config.FilterSizes[size] = true
-	e.manualFilterSizes[size] = true
-	delete(e.autoFilterSizes, size)
-	e.Config.Unlock()
-	e.scheduleBuildSnapshot()
-}
-
-func (e *Engine) AddAutoFilterSize(size int) {
-	e.Config.Lock()
-	e.Config.FilterSizes[size] = true
-	if !e.manualFilterSizes[size] {
-		e.autoFilterSizes[size] = true
-	}
 	e.Config.Unlock()
 	e.scheduleBuildSnapshot()
 }
@@ -319,20 +305,6 @@ func (e *Engine) AddAutoFilterSize(size int) {
 func (e *Engine) RemoveFilterSize(size int) {
 	e.Config.Lock()
 	delete(e.Config.FilterSizes, size)
-	delete(e.manualFilterSizes, size)
-	delete(e.autoFilterSizes, size)
-	e.Config.Unlock()
-	e.scheduleBuildSnapshot()
-}
-
-func (e *Engine) clearAutoFilterSizes() {
-	e.Config.Lock()
-	for size := range e.autoFilterSizes {
-		if !e.manualFilterSizes[size] {
-			delete(e.Config.FilterSizes, size)
-		}
-	}
-	e.autoFilterSizes = make(map[int]bool)
 	e.Config.Unlock()
 	e.scheduleBuildSnapshot()
 }

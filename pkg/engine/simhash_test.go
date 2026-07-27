@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -126,4 +127,28 @@ func BenchmarkSimhashBodyNew(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = simhashBody(body)
 	}
+}
+
+func TestSimhashTrackerConcurrentConfigureAndUse(t *testing.T) {
+	tracker := NewSimhashTracker(3, 5)
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			tracker.Configure(i%5, 1+i%8)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			tracker.IsSoftFour(uint64(i + 1))
+			if i%10 == 0 {
+				tracker.SeedBaseline(uint64(i + 10000))
+			}
+		}
+	}()
+
+	wg.Wait()
 }

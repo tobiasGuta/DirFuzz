@@ -1,7 +1,10 @@
 package engine
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestResultToEvidenceConversion(t *testing.T) {
@@ -99,6 +102,79 @@ func Test403ValidationDoesNotSelfAmplify(t *testing.T) {
 	actions2 := g.UpdateEvidence(nodeID, resp)
 	if len(actions2) != 0 {
 		t.Fatalf("Expected 0 new actions, deduplication against ActionHistory failed!")
+	}
+}
+
+func TestFeedbackLoopSubmissionIsTrackedByWait(t *testing.T) {
+	eng := NewEngine(1, 100, 0.01)
+	atomic.StoreInt64(&eng.RunID, 42)
+
+	nodeID, _ := eng.DiscoveryGraph.AddPathNode(
+		"",
+		"/secret",
+		"secret",
+		"response",
+		DiscoveryEvidence{},
+	)
+	eng.processFeedbackLoop(Result{
+		DiscoveryNodeID: nodeID,
+		StatusCode:      403,
+		ContentType:     "text/html",
+		Size:            500,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	job, ok, err := eng.jobs.Pop(ctx)
+	if err != nil || !ok {
+		eng.Shutdown()
+		t.Fatalf("feedback job was not queued: ok=%t err=%v", ok, err)
+	}
+
+	waitStarted := make(chan struct{})
+	waitDone := make(chan struct{})
+	go func() {
+		close(waitStarted)
+		eng.Wait()
+		close(waitDone)
+	}()
+	<-waitStarted
+
+	tracked := true
+	select {
+	case <-waitDone:
+		tracked = false
+	case <-time.After(50 * time.Millisecond):
+	}
+	if tracked {
+		eng.activeJobs.Done()
+		<-waitDone
+	}
+	eng.Shutdown()
+
+	if !tracked {
+		t.Fatal("Wait returned while the feedback job was still active")
+	}
+	if job.RunID != 42 {
+		t.Fatalf("feedback job RunID = %d, want current RunID 42", job.RunID)
+	}
+	if job.Type != JobTypeValidation {
+		t.Fatalf("feedback job Type = %q, want %q", job.Type, JobTypeValidation)
+	}
+	if job.Path != "/secret" {
+		t.Fatalf("feedback job Path = %q, want /secret", job.Path)
+	}
+	if job.DiscoveryNodeID != nodeID {
+		t.Fatalf("feedback job DiscoveryNodeID = %q, want %q", job.DiscoveryNodeID, nodeID)
+	}
+	if job.PriorityScore != 85 {
+		t.Fatalf("feedback job PriorityScore = %d, want 85", job.PriorityScore)
+	}
+	if job.Reason != ReasonFeedback {
+		t.Fatalf("feedback job Reason = %q, want %q", job.Reason, ReasonFeedback)
+	}
+	if job.CreatedAt.IsZero() {
+		t.Fatal("feedback job CreatedAt was not set")
 	}
 }
 

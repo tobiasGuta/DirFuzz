@@ -120,14 +120,7 @@ func randomString(n int) string {
 	return string(b)
 }
 
-func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
-	e.Config.RLock()
-	delay := e.Config.Delay
-	e.Config.RUnlock()
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-
+func (e *Engine) checkRecursiveWildcard(ctx context.Context, dirPath string) bool {
 	currentBaseURL := e.BaseURL()
 	word := strings.TrimSuffix(dirPath, "/") + "/" + randomString(RecursiveWildcardTestLen)
 	if !strings.HasPrefix(word, "/") {
@@ -171,21 +164,24 @@ func (e *Engine) checkRecursiveWildcard(dirPath string) bool {
 	if e.proxyDialer {
 		proxyAddr = e.GetNextProxy()
 	}
-	sc := e.scannerCtx.Load()
-	if sc == nil {
+
+	// Keep recursion probes within the same per-host request budget as jobs.
+	if err := e.getLimiter(parsedURL.Host).Wait(ctx); err != nil {
 		return true
 	}
-	resp, err := e.executeRequestOnceQuiet(sc.ctx, fullURL, rawRequest, RecursiveWildcardTimeout, proxyAddr)
+	resp, err := e.executeRequestOnceQuiet(ctx, fullURL, rawRequest, RecursiveWildcardTimeout, proxyAddr)
 	if err != nil {
 		// Fail closed for recursion probes: if this endpoint drops or times out
 		// on unknown children, recursing below it will amplify network errors.
 		return true
 	}
-	// Treat permissive and redirect responses as wildcard indicators.
+	// Treat permissive, authentication-wall, and redirect responses as
+	// wildcard indicators.
 	// Some servers redirect unknown paths (e.g. /*) with 301/302 — these
 	// should be treated as wildcard directories to avoid unbounded
 	// recursive scanning.
-	if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 {
+	if resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 ||
+		resp.StatusCode == 401 || resp.StatusCode == 403 {
 		return true
 	}
 	return false

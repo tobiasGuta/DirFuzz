@@ -9,11 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"dirfuzz/pkg/httpclient"
 
 	"golang.org/x/time/rate"
 )
@@ -83,7 +86,7 @@ func TestCheckRecursiveWildcardFailsClosedOnEmptyResponse(t *testing.T) {
 	defer cancel()
 	eng.scannerCtx.Store(&scannerContext{ctx: ctx, cancel: cancel})
 
-	if !eng.checkRecursiveWildcard("/jobs.php") {
+	if !eng.checkRecursiveWildcard(ctx, "/jobs.php") {
 		t.Fatal("expected recursive wildcard check to fail closed on empty response")
 	}
 
@@ -94,27 +97,28 @@ func TestCheckRecursiveWildcardFailsClosedOnEmptyResponse(t *testing.T) {
 	}
 }
 
-func TestCheckRecursiveWildcardDoesNotTreat403AsWildcard(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer server.Close()
+func TestCheckRecursiveWildcardTreatsAuthWallsAsWildcard(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
 
-	eng := NewEngine(1, 100, 0.01)
-	defer eng.Shutdown()
-	eng.Config.Lock()
-	eng.Config.AllowPrivateTargets = true
-	eng.Config.Unlock()
-	eng.RefreshConfigSnapshot()
-	if err := eng.SetTarget(server.URL); err != nil {
-		t.Fatalf("SetTarget() failed: %v", err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	eng.scannerCtx.Store(&scannerContext{ctx: ctx, cancel: cancel})
+			eng := NewEngine(1, 100, 0.01)
+			defer eng.Shutdown()
+			eng.Config.Lock()
+			eng.Config.AllowPrivateTargets = true
+			eng.Config.Unlock()
+			eng.RefreshConfigSnapshot()
+			if err := eng.SetTarget(server.URL); err != nil {
+				t.Fatalf("SetTarget() failed: %v", err)
+			}
 
-	if eng.checkRecursiveWildcard("/jobs.php") {
-		t.Fatal("expected recursive wildcard check to ignore 403 responses")
+			if !eng.checkRecursiveWildcard(context.Background(), "/jobs.php") {
+				t.Fatalf("expected recursive wildcard check to treat %d as a wildcard auth wall", status)
+			}
+		})
 	}
 }
 
@@ -440,8 +444,7 @@ func TestDiscoverParamHitsBisectsHiddenParameters(t *testing.T) {
 
 func TestSimhashSoft404Clustering(t *testing.T) {
 	eng := NewEngine(1, 100, 0.01)
-	eng.simhashTracker.Threshold = 3
-	eng.simhashTracker.ClusterLimit = 2
+	eng.simhashTracker.Configure(3, 2)
 
 	if eng.simhashTracker.IsSoftFour(0x1234567890abcdef) {
 		t.Fatal("first cluster member should not be suppressed")
@@ -457,10 +460,149 @@ func TestSimhashSoft404Clustering(t *testing.T) {
 	}
 }
 
+func TestDefaultHeadResponsesAreNotSimhashFiltered(t *testing.T) {
+	const responseCount = DefaultSimhashClusterLimit + 4
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("request method = %q, want HEAD", r.Method)
+		}
+		size := 1000 + len(r.URL.Path)
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.Header().Set("X-Response-Path", r.URL.Path)
+		w.WriteHeader(http.StatusOK + len(r.URL.Path)%2)
+	}))
+	defer server.Close()
+
+	eng := NewEngine(1, 100, 0.01)
+	defer eng.Shutdown()
+	eng.UpdateConfig(func(c *Config) {
+		c.AllowPrivateTargets = true
+		c.AutoFilterThreshold = 0
+	})
+	if err := eng.SetTarget(server.URL); err != nil {
+		t.Fatalf("SetTarget() failed: %v", err)
+	}
+
+	eng.Start()
+	runID := atomic.LoadInt64(&eng.RunID)
+	for i := 0; i < responseCount; i++ {
+		path := fmt.Sprintf("/head-result-%02d-%s", i, strings.Repeat("x", i))
+		eng.Submit(Job{Path: path, RunID: runID})
+	}
+	eng.Wait()
+
+	var results []Result
+	for len(eng.Results) > 0 {
+		results = append(results, <-eng.Results)
+	}
+	if len(results) != responseCount {
+		t.Fatalf("kept %d of %d distinct HEAD responses; simhash suppressed %d",
+			len(results), responseCount, atomic.LoadInt64(&eng.SimhashSuppressed))
+	}
+	for _, result := range results {
+		if result.Method != http.MethodHead {
+			t.Errorf("result method = %q, want HEAD", result.Method)
+		}
+	}
+	if got := atomic.LoadInt64(&eng.SimhashSuppressed); got != 0 {
+		t.Fatalf("SimhashSuppressed = %d, want 0 for HEAD responses", got)
+	}
+}
+
+func TestApplyFiltersOnlyClustersUsableBodyHashes(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		resp       *httpclient.RawResponse
+		bodyHash   uint64
+		wantSecond bool
+	}{
+		{
+			name:       "complete decoded GET body",
+			method:     http.MethodGet,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, Body: []byte("usable body"), BodyComplete: true},
+			bodyHash:   0x1234,
+			wantSecond: false,
+		},
+		{
+			name:       "HEAD method",
+			method:     http.MethodHead,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, Body: []byte("unexpected body"), BodyComplete: true},
+			bodyHash:   0x1234,
+			wantSecond: true,
+		},
+		{
+			name:       "empty body",
+			method:     http.MethodGet,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, BodyComplete: true},
+			bodyHash:   0x1234,
+			wantSecond: true,
+		},
+		{
+			name:       "encoded body",
+			method:     http.MethodGet,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, Body: []byte("encoded"), BodyComplete: true, BodyEncoded: true},
+			bodyHash:   0x1234,
+			wantSecond: true,
+		},
+		{
+			name:       "incomplete body",
+			method:     http.MethodGet,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, Body: []byte("partial")},
+			bodyHash:   0x1234,
+			wantSecond: true,
+		},
+		{
+			name:       "zero body hash",
+			method:     http.MethodGet,
+			resp:       &httpclient.RawResponse{StatusCode: http.StatusOK, Body: []byte("!!!"), BodyComplete: true},
+			bodyHash:   0,
+			wantSecond: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := NewEngine(1, 100, 0.01)
+			defer eng.Shutdown()
+			eng.simhashTracker.Configure(0, 2)
+
+			apply := func() bool {
+				return eng.applyFilters(
+					tc.resp,
+					tc.method,
+					len(tc.resp.Body), 0, 0,
+					tc.bodyHash,
+					"",
+					false,
+					nil, nil, nil,
+					-1, -1, -1, -1,
+					nil, nil,
+					0, 0,
+					false,
+				)
+			}
+			if !apply() {
+				t.Fatal("first response should not be suppressed")
+			}
+			if got := apply(); got != tc.wantSecond {
+				t.Fatalf("second response kept = %t, want %t", got, tc.wantSecond)
+			}
+			wantSuppressed := int64(0)
+			if !tc.wantSecond {
+				wantSuppressed = 1
+			}
+			if got := atomic.LoadInt64(&eng.SimhashSuppressed); got != wantSuppressed {
+				t.Fatalf("SimhashSuppressed = %d, want %d", got, wantSuppressed)
+			}
+		})
+	}
+}
+
 func TestSimhashSeedBaseline(t *testing.T) {
 	eng := NewEngine(1, 100, 0.01)
-	eng.simhashTracker.Threshold = 3
-	eng.simhashTracker.ClusterLimit = 2
+	eng.simhashTracker.Configure(3, 2)
 
 	hash := uint64(0x1234567890abcdef)
 	eng.simhashTracker.SeedBaseline(hash)
@@ -479,7 +621,6 @@ func TestSimhashSeedBaseline(t *testing.T) {
 		t.Fatal("distant hash should not be suppressed by seeded baseline")
 	}
 }
-
 
 func TestSpiderChildJobIncrementsDepth(t *testing.T) {
 	parent := Job{Path: "/page/1", Depth: 4, Method: "GET", RunID: 99}
@@ -552,7 +693,6 @@ func TestEngineCalibrateSoft404(t *testing.T) {
 		t.Fatal("expected soft-404 baseline to be suppressed immediately after calibration")
 	}
 }
-
 
 func TestAutoCalibrateUsesNormalizedBodySize(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -900,7 +1040,7 @@ func TestWorkerVerbTamperHonorsManualOverrideHeader(t *testing.T) {
 
 func TestSmartProxyCooldown(t *testing.T) {
 	eng := NewEngine(1, 100, 0.01)
-	
+
 	eng.proxiesLock.Lock()
 	eng.proxies = []smartProxy{
 		{addr: "http://127.0.0.1:8081"},
@@ -948,4 +1088,3 @@ func TestSmartProxyCooldown(t *testing.T) {
 		t.Fatalf("blocked proxy %s should have returned to rotation after recovery", blockedAddr)
 	}
 }
-

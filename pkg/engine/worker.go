@@ -64,23 +64,29 @@ func (e *Engine) processFeedbackLoop(res Result) {
 		return
 	}
 
+	runID := atomic.LoadInt64(&e.RunID)
+	jobs := make([]Job, 0, len(actions))
 	e.DiscoveryGraph.RLock()
-	defer e.DiscoveryGraph.RUnlock()
-
 	for _, a := range actions {
 		node, ok := e.DiscoveryGraph.Nodes[a.NodeID]
 		if !ok {
 			continue
 		}
 
-		e.jobs.Push(context.Background(), Job{
+		jobs = append(jobs, Job{
 			Type:            JobType(a.Type),
 			Path:            node.CanonicalPath,
+			RunID:           runID,
 			DiscoveryNodeID: a.NodeID,
 			PriorityScore:   a.Priority,
 			Reason:          ReasonFeedback,
 			CreatedAt:       time.Now().UTC(),
 		})
+	}
+	e.DiscoveryGraph.RUnlock()
+
+	for _, job := range jobs {
+		e.Submit(job)
 	}
 }
 
@@ -99,21 +105,17 @@ func verbTamperHeaders(method string) map[string]string {
 	}
 }
 
-func (e *Engine) worker(id int) {
+func (e *Engine) worker(id int, ctx context.Context, control *workerControl) {
 	defer func() {
+		control.cancel()
+		e.workerLock.Lock()
+		if e.workerControls[id] == control {
+			delete(e.workerControls, id)
+		}
+		e.workerLock.Unlock()
 		e.emitLogEvent(LogLevelInfo, LogCategoryWorker, EventWorkerStopped, fmt.Sprintf("worker %d stopped", id), map[string]interface{}{"worker_id": id})
 		e.activeWorkers.Add(-1)
 		e.wg.Done()
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		select {
-		case <-e.workerStopCh:
-			cancel()
-		case <-ctx.Done():
-		}
 	}()
 
 	for {
@@ -543,46 +545,28 @@ func (e *Engine) worker(id int) {
 		// Deduplication via detectedTech sync.Map prevents log flooding.
 		var detectedTechs []string
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 && len(resp.Body) > 0 {
-		    cookies := parseCookiesFromRawHeaders(resp.Headers)
-		    detectedTechs = e.fingerprinter.Detect(resp.HeaderMap, cookies, resp.Body)
-		    for _, tech := range detectedTechs {
-		        dedupeKey := reqHostname + ":" + tech
-		        if _, loaded := e.detectedTech.LoadOrStore(dedupeKey, true); !loaded {
-		            // Emit once per host per scan to the TUI and Monitor
-		            e.emitLogEvent(LogLevelSuccess, LogCategoryDiscovery, "TechDetected",
-		                fmt.Sprintf("Identified tech stack %q on %s", tech, reqHostname),
-		                map[string]interface{}{"host": reqHostname, "tech": tech})
-		        }
-		    }
+			cookies := parseCookiesFromRawHeaders(resp.Headers)
+			detectedTechs = e.fingerprinter.Detect(resp.HeaderMap, cookies, resp.Body)
+			for _, tech := range detectedTechs {
+				dedupeKey := reqHostname + ":" + tech
+				if _, loaded := e.detectedTech.LoadOrStore(dedupeKey, true); !loaded {
+					// Emit once per host per scan to the TUI and Monitor
+					e.emitLogEvent(LogLevelSuccess, LogCategoryDiscovery, "TechDetected",
+						fmt.Sprintf("Identified tech stack %q on %s", tech, reqHostname),
+						map[string]interface{}{"host": reqHostname, "tech": tech})
+				}
+			}
 		}
 		// [FUTURE] Tech-aware wordlist injection:
 		// e.queueTechWordlist(tech) — loads wordlists/spring-boot.txt etc into the scan queue
 
 		skipRTFilters := timingOracleHit
 
-		// Apply all filters.
-		if !e.applyFilters(resp, bodySize, wordCount, lineCount, bodyHash, contentType,
-			timingOracleHit,
-			filterSizes, filterSizeRanges, matchCodes,
-			filterWords, filterLines, matchWords, matchLines,
-			matchContentTypes, filterContentTypes,
-			filterRTMin, filterRTMax,
-			skipRTFilters) {
-			if e.cleanupJob(shouldExit) {
-				return
-			}
-			continue
-		}
-
-		if harvestSourceMaps && resp.StatusCode >= 200 && resp.StatusCode < 300 && e.shouldHarvestSourceMap(parsedURL.Path, contentType) {
-			sourceMapURL := ExtractSourceMapURL(resp.HeaderMap, resp.Body)
-			if sourceMapURL != "" {
-				baseURL := fullURL
-				if finalRedirectURL != "" {
-					baseURL = finalRedirectURL
-				}
-				e.scheduleSourceMapHarvest(localCtx, baseURL, sourceMapURL, snap, job.RunID, job.HarvestDepth+1)
-			}
+		// Validation is operational work, not a display decision. Schedule it
+		// before any status/size/regex/timing/content/SimHash filtering.
+		if snap.FourOhThreeBypass && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized) && bodySize >= 0 {
+			bypassCtx := context.WithValue(localCtx, bypassBaselineSizeKey{}, bodySize)
+			e.schedule403BypassTask(bypassCtx, fullURL, reqPath, successfulMethod, headers, snap)
 		}
 
 		// 403 classification.
@@ -654,7 +638,7 @@ func (e *Engine) worker(id int) {
 							e.logWAFBypassOutcome(detectedWAFVendor, technique.Name, payload, false, 0)
 							continue
 						}
-						if bypassResp.StatusCode == 403 || bypassResp.StatusCode == 429 || bypassResp.StatusCode == 444 {
+						if !isMeaningfulBypassResponse(resp, bypassResp) {
 							e.EvasionScoreboard.Record(technique.Name, false)
 							e.logWAFBypassOutcome(detectedWAFVendor, technique.Name, payload, false, bypassResp.StatusCode)
 							continue
@@ -692,12 +676,35 @@ func (e *Engine) worker(id int) {
 			}
 		}
 
+		// Display filtering happens only after configured validation and inline
+		// WAF bypass work have had a chance to inspect the blocked response.
+		if !e.applyFilters(resp, successfulMethod, bodySize, wordCount, lineCount, bodyHash, contentType,
+			timingOracleHit,
+			filterSizes, filterSizeRanges, matchCodes,
+			filterWords, filterLines, matchWords, matchLines,
+			matchContentTypes, filterContentTypes,
+			filterRTMin, filterRTMax,
+			skipRTFilters) {
+			if e.cleanupJob(shouldExit) {
+				return
+			}
+			continue
+		}
+
+		if harvestSourceMaps && resp.StatusCode >= 200 && resp.StatusCode < 300 && e.shouldHarvestSourceMap(parsedURL.Path, contentType) {
+			sourceMapURL := ExtractSourceMapURL(resp.HeaderMap, resp.Body)
+			if sourceMapURL != "" {
+				baseURL := fullURL
+				if finalRedirectURL != "" {
+					baseURL = finalRedirectURL
+				}
+				e.scheduleSourceMapHarvest(localCtx, baseURL, sourceMapURL, snap, job.RunID, job.HarvestDepth+1)
+			}
+		}
+
 		// Smart Filter.
 		if bodySize != -1 && (resp.StatusCode == 200 || resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 403) {
-			fpKey := fmt.Sprintf("%d:%d", resp.StatusCode, bodySize)
-			if resp.StatusCode == 403 {
-				fpKey = fmt.Sprintf("403:%s:%d", forbidden403Type, bodySize)
-			}
+			fpKey := makeAutoFilterFingerprint(resp.StatusCode, bodySize, contentType, bodyHash, forbidden403Type)
 
 			e.fpMutex.Lock()
 			e.fpCounts[fpKey]++
@@ -706,12 +713,13 @@ func (e *Engine) worker(id int) {
 
 			threshold := autoFilterThreshold
 			if threshold > 0 && count == threshold {
-				e.AddAutoFilterSize(bodySize)
-				e.emitLogEvent(LogLevelSuccess, LogCategoryFilter, EventAutoFilterTriggered, fmt.Sprintf("auto-filter triggered for size %d", bodySize), map[string]interface{}{
-					"body_size": bodySize,
-					"status":    resp.StatusCode,
-					"count":     count,
-					"threshold": threshold,
+				e.emitLogEvent(LogLevelSuccess, LogCategoryFilter, EventAutoFilterTriggered, fmt.Sprintf("auto-filter triggered for repetitive response fingerprint at size %d", bodySize), map[string]interface{}{
+					"body_size":    bodySize,
+					"body_hash":    fmt.Sprintf("%016x", bodyHash),
+					"content_type": contentType,
+					"status":       resp.StatusCode,
+					"count":        count,
+					"threshold":    threshold,
 				})
 				select {
 				case e.Results <- Result{
@@ -719,7 +727,7 @@ func (e *Engine) worker(id int) {
 					Method:       successfulMethod,
 					StatusCode:   resp.StatusCode,
 					Size:         bodySize,
-					Headers:      map[string]string{"Msg": fmt.Sprintf("Auto-filtered repetitive size: %d", bodySize)},
+					Headers:      map[string]string{"Msg": fmt.Sprintf("Auto-filtered repetitive response fingerprint at size: %d", bodySize)},
 					IsAutoFilter: true,
 				}:
 					e.resultsCollected.Add(1)
@@ -733,11 +741,6 @@ func (e *Engine) worker(id int) {
 				}
 				continue
 			}
-		}
-
-		if snap.FourOhThreeBypass && (resp.StatusCode == 403 || resp.StatusCode == 401) && bodySize >= 0 {
-			bypassCtx := context.WithValue(localCtx, bypassBaselineSizeKey{}, bodySize)
-			e.schedule403BypassTask(bypassCtx, fullURL, reqPath, successfulMethod, headers, snap)
 		}
 
 		// Capture interesting headers.
@@ -777,13 +780,11 @@ func (e *Engine) worker(id int) {
 			result.Duration = timingMedian
 		}
 
-		// Unconditionally capture byte slices for plugin and internal use.
-		// SaveRaw only dictates whether they are mapped to the JSON strings.
-		result.RequestBytes = append([]byte(nil), rawRequest...)
-		result.ResponseBytes = append([]byte(nil), resp.Raw...)
 		if saveRaw {
 			result.Request = string(rawRequest)
 			result.Response = string(resp.Raw)
+			result.RequestBytes = append([]byte(nil), rawRequest...)
+			result.ResponseBytes = append([]byte(nil), resp.Raw...)
 		}
 
 		if len(allAuthRoles) > 0 {
@@ -792,29 +793,29 @@ func (e *Engine) worker(id int) {
 					continue
 				}
 				arSize, arWords, arLines, arContentType, _ := computeResponseMetrics(ar.resp, successfulMethod)
-				
+
 				arCapturedHeaders := make(map[string]string)
 				for lowerKey, mappedKey := range interesting {
 					if val, ok := ar.resp.HeaderMap[lowerKey]; ok {
 						arCapturedHeaders[mappedKey] = val
 					}
 				}
-				
+
 				dt := AuthRoleDetail{
-					Role:          ar.role,
-					StatusCode:    ar.resp.StatusCode,
-					Size:          arSize,
-					Words:         arWords,
-					Lines:         arLines,
-					Duration:      ar.resp.Duration,
-					ContentType:   arContentType,
-					Headers:       arCapturedHeaders,
-					RequestBytes:  append([]byte(nil), ar.rawRequest...),
-					ResponseBytes: append([]byte(nil), ar.resp.Raw...),
+					Role:        ar.role,
+					StatusCode:  ar.resp.StatusCode,
+					Size:        arSize,
+					Words:       arWords,
+					Lines:       arLines,
+					Duration:    ar.resp.Duration,
+					ContentType: arContentType,
+					Headers:     arCapturedHeaders,
 				}
 				if saveRaw {
 					dt.Request = string(ar.rawRequest)
 					dt.Response = string(ar.resp.Raw)
+					dt.RequestBytes = append([]byte(nil), ar.rawRequest...)
+					dt.ResponseBytes = append([]byte(nil), ar.resp.Raw...)
 				}
 				result.AuthRoles = append(result.AuthRoles, dt)
 			}
@@ -836,7 +837,7 @@ func (e *Engine) worker(id int) {
 		// Append tech detections — immortalizes findings in the immutable Event Ledger
 		// Format: "TECH:nginx", "TECH:PHP" etc. Survives time-travel replay natively.
 		for _, tech := range detectedTechs {
-		    result.Labels = append(result.Labels, "TECH:"+tech)
+			result.Labels = append(result.Labels, "TECH:"+tech)
 		}
 
 		// Eagle mode compares the current hit against the previous JSONL baseline.

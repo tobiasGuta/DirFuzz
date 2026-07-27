@@ -153,6 +153,32 @@ func NewPriorityQueue(maxLen int) *PriorityJobQueue {
 	return q
 }
 
+// signalNotEmptyLocked wakes a consumer when queued work remains. The caller
+// must hold q.mu.
+func (q *PriorityJobQueue) signalNotEmptyLocked() {
+	if q.closed || q.h.Len() == 0 {
+		return
+	}
+	select {
+	case q.notEmpty <- struct{}{}:
+	default:
+	}
+}
+
+// signalNotFullLocked wakes a producer when capacity remains. Re-signaling
+// after a successful Push lets a single bulk-capacity notification (for
+// example, from Drain) cascade to all producers that can now make progress.
+// The caller must hold q.mu.
+func (q *PriorityJobQueue) signalNotFullLocked() {
+	if q.closed || q.maxLen == 0 || q.h.Len() >= q.maxLen {
+		return
+	}
+	select {
+	case q.notFull <- struct{}{}:
+	default:
+	}
+}
+
 func (q *PriorityJobQueue) Push(ctx context.Context, job Job) error {
 	for {
 		q.mu.Lock()
@@ -162,10 +188,8 @@ func (q *PriorityJobQueue) Push(ctx context.Context, job Job) error {
 		}
 		if q.maxLen == 0 || q.h.Len() < q.maxLen {
 			heap.Push(q.h, job)
-			select {
-			case q.notEmpty <- struct{}{}:
-			default:
-			}
+			q.signalNotEmptyLocked()
+			q.signalNotFullLocked()
 			q.mu.Unlock()
 			return nil
 		}
@@ -185,10 +209,8 @@ func (q *PriorityJobQueue) Pop(ctx context.Context) (Job, bool, error) {
 		q.mu.Lock()
 		if q.h.Len() > 0 {
 			job := heap.Pop(q.h).(Job)
-			select {
-			case q.notFull <- struct{}{}:
-			default:
-			}
+			q.signalNotEmptyLocked()
+			q.signalNotFullLocked()
 			q.mu.Unlock()
 			return job, true, nil
 		}
@@ -228,11 +250,8 @@ func (q *PriorityJobQueue) Drain() int {
 	defer q.mu.Unlock()
 	count := q.h.Len()
 	*q.h = (*q.h)[:0]
-	if count > 0 && !q.closed {
-		select {
-		case q.notFull <- struct{}{}:
-		default:
-		}
+	if count > 0 {
+		q.signalNotFullLocked()
 	}
 	return count
 }
