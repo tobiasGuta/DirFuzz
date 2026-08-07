@@ -1,0 +1,37 @@
+plugins {
+    id 'java'
+}
+
+group = 'io.github.tobiasguta'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+dependencies {
+    compileOnly 'net.portswigger.burp.extensions:montoya-api:2026.4'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+test {
+    useJUnitPlatform()
+}
+
+jar {
+    archiveBaseName = 'copy-as-dirfuzz'
+    manifest {
+        attributes('Implementation-Title': 'Copy as DirFuzz',
+                   'Implementation-Version': project.version)
+    }
+}
