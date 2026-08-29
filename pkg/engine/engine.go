@@ -697,6 +697,9 @@ type Engine struct {
 	// Ensure Shutdown only runs once to avoid double-closing channels.
 	shutdownOnce       sync.Once
 	changeWordlistLock sync.Mutex
+	submissionMu       sync.Mutex
+	submissionWg       sync.WaitGroup
+	restarting         bool
 }
 
 // ─── Constant classification strings ─────────────────────────────────────────
@@ -1108,16 +1111,62 @@ func (e *Engine) ChangeWordlist(path string) error {
 	e.changeWordlistLock.Lock()
 	defer e.changeWordlistLock.Unlock()
 
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return fmt.Errorf("wordlist file does not exist: %s", path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat wordlist %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("wordlist path is a directory: %s", path)
 	}
 
+	// Restart may be requested while scanners or workers are blocked publishing
+	// old results. Drain only for the duration of the generation handoff so
+	// those goroutines can finish without stealing results from the new run.
+	stopDrain := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case _, ok := <-e.Results:
+				if !ok {
+					return
+				}
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+
+	// Close submission admission before cancelling the old generation. Any
+	// Submit already admitted is tracked by submissionWg; later submissions are
+	// rejected until the new scanner context is installed.
+	e.submissionMu.Lock()
+	e.restarting = true
 	if oldCtx := e.scannerCtx.Load(); oldCtx != nil && oldCtx.cancel != nil {
 		oldCtx.cancel()
-		e.scannerWg.Wait() // Ensure old scanner has completely stopped before resetting state
 	}
+	sentinelCtx, sentinelCancel := context.WithCancel(context.Background())
+	sentinelCancel()
+	e.scannerCtx.Store(&scannerContext{ctx: sentinelCtx, cancel: sentinelCancel})
+	atomic.AddInt64(&e.RunID, 1) // invalidate children from the previous run
+	e.submissionMu.Unlock()
 
-	// Drain any in-flight replay tasks from the old wordlist
+	// All Submit calls that crossed the admission boundary before restart must
+	// finish before we drain. This removes the Add-vs-Wait race that previously
+	// required polling activeJobs with short-lived waiter goroutines.
+	e.submissionWg.Wait()
+	e.drainJobs()
+
+	// Existing workers and bounded auxiliary tasks may still be finishing old
+	// work, but no new queue submissions can now be admitted.
+	e.activeJobs.Wait()
+	e.scannerWg.Wait()
+
+	close(stopDrain)
+	<-drainDone
+
+	// Drain replay work only after the old generation is fully quiescent.
 drainLoop:
 	for {
 		select {
@@ -1127,6 +1176,8 @@ drainLoop:
 		}
 	}
 
+	// It is now safe to reset generation-scoped mutable state. No old worker is
+	// still reading or writing these structures.
 	e.shardedFilter = newShardedBloomFilter(bloomFilterShards, DefaultBloomFilterSize, DefaultBloomFilterFP)
 
 	atomic.StoreInt64(&e.ProcessedLines, 0)
@@ -1156,63 +1207,12 @@ drainLoop:
 	atomic.StoreInt64(&e.AutoFilterSuppressed, 0)
 	atomic.StoreInt64(&e.SimhashSuppressed, 0)
 
-	// Install a pre-cancelled sentinel context so any goroutine that races to
-	// call Submit() after this point will either:
-	//   (a) see ctx.Done() in the select and call activeJobs.Done() directly, or
-	//   (b) succeed in sending to e.jobs (which we will drain below).
-	// This closes the window where a new live context could be loaded.
-	sentinelCtx, sentinelCancel := context.WithCancel(context.Background())
-	sentinelCancel() // immediately cancelled
-	e.scannerCtx.Store(&scannerContext{ctx: sentinelCtx, cancel: sentinelCancel})
-
-	// Drain Results concurrently so workers blocked on `e.Results <- res` can
-	// proceed and call activeJobs.Done(). Without this, ChangeWordlist deadlocks
-	// when nobody else is consuming Results (e.g. in tests, or a full buffer).
-	stopDrain := make(chan struct{})
-	drainDone := make(chan struct{})
-	go func() {
-		defer close(drainDone)
-		for {
-			select {
-			case <-e.Results:
-				// discard — caller is restarting the scan
-			case <-stopDrain:
-				return
-			}
-		}
-	}()
-
-	// Drain the jobs queue in a loop until activeJobs reaches zero.
-	// We must loop because Submit does activeJobs.Add(1) BEFORE sending to the
-	// channel — a job may land in the queue after a previous drainJobs call
-	// returned but before activeJobs reaches zero. Polling every millisecond is
-	// cheap compared to the alternatives.
-	for {
-		e.drainJobs()
-		// Use a short-lived WaitGroup trick: if the counter is already 0 this
-		// returns immediately; otherwise we yield briefly and drain again.
-		done := make(chan struct{})
-		go func() {
-			e.activeJobs.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-			// activeJobs reached zero — we're clean.
-			close(stopDrain)
-			<-drainDone
-			goto startNewScan
-		case <-time.After(time.Millisecond):
-			// Still pending; drain the queue again and retry.
-		}
-	}
-
-startNewScan:
-	// Now install the real live context and start the new scan.
+	// Publish the new generation atomically with reopening submission admission.
 	ctx, cancel := context.WithCancel(context.Background())
+	e.submissionMu.Lock()
 	e.scannerCtx.Store(&scannerContext{ctx: ctx, cancel: cancel})
-
-	atomic.AddInt64(&e.RunID, 1)
+	e.restarting = false
+	e.submissionMu.Unlock()
 
 	e.KickoffScanner(path, 0)
 	return nil
