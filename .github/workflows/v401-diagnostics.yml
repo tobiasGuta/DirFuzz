@@ -1,0 +1,60 @@
+name: v4.0.1 diagnostics
+
+on:
+  push:
+    branches:
+      - fix/v4.0.1-reliability
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Show restart submission boundary
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def function(src, needle):
+              start = src.index(needle)
+              brace = src.index('{', start)
+              depth = 0
+              in_string = None
+              escape = False
+              for i in range(brace, len(src)):
+                  ch = src[i]
+                  if in_string:
+                      if escape:
+                          escape = False
+                      elif ch == '\\':
+                          escape = True
+                      elif ch == in_string:
+                          in_string = None
+                      continue
+                  if ch in ('"', "'", '`'):
+                      in_string = ch
+                      continue
+                  if ch == '{': depth += 1
+                  elif ch == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[start:i+1]
+              raise RuntimeError('unterminated function')
+
+          for path, needle in [
+              ('pkg/engine/engine.go', 'func (e *Engine) ChangeWordlist'),
+              ('pkg/engine/engine.go', 'func (e *Engine) Submit'),
+          ]:
+              src = Path(path).read_text()
+              print(f'===== {path}: {needle} =====')
+              print(function(src, needle))
+          PY
+      - name: Reproduce focused concurrency test
+        run: go test ./pkg/engine -run '^TestChangeWordlistConcurrency$' -count=10 -timeout=90s
