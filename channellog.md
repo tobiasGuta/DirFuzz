@@ -1,3 +1,11 @@
+## v4.0.2 — HTTP Reliability & Fidelity (2026-08-29)
+
+- Interrupt raw socket and HTTP CONNECT I/O promptly when request contexts are cancelled.
+- Prevent transparent replay of non-safe methods after ambiguous write/read failures, including configured engine retries.
+- Reject conflicting `Content-Length`, `Transfer-Encoding` + `Content-Length`, and invalid non-final `chunked` response framing.
+- Preserve redirect method/body semantics for 307/308 and strip standard credentials when redirects cross origins.
+- Add focused regression coverage for cancellation, framing, replay policy, and redirect behavior.
+
 # DirFuzz MCP Monitor Change Log
 
 ## v4.0.1 — Reliability & HTTP Fidelity (2026-08-28)
