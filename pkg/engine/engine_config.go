@@ -93,10 +93,17 @@ func (e *Engine) buildAndStoreConfigSnapshot() {
 	ua := s.UserAgent
 	for k, v := range e.Config.Headers {
 		if strings.EqualFold(k, "User-Agent") {
-			ua = normalizeUserAgent(v)
+			ua = sanitizeHeaderToken(normalizeUserAgent(v))
 			continue
 		}
-		s.Headers[k] = v
+		if isGeneratedRequestHeader(k) {
+			continue
+		}
+		safeK := sanitizeHeaderToken(strings.TrimSpace(k))
+		if safeK == "" {
+			continue
+		}
+		s.Headers[safeK] = sanitizeHeaderToken(v)
 	}
 	s.UserAgent = ua
 
@@ -249,9 +256,24 @@ func (e *Engine) SetDelay(d time.Duration) {
 	e.UpdateRateLimiterFromDelay()
 }
 
+func isGeneratedRequestHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "host", "content-length":
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *Engine) AddHeader(key, val string) {
+	key = sanitizeHeaderToken(strings.TrimSpace(key))
+	if key == "" || isGeneratedRequestHeader(key) {
+		return
+	}
+	val = sanitizeHeaderToken(val)
+
 	e.Config.Lock()
-	if strings.EqualFold(strings.TrimSpace(key), "User-Agent") {
+	if strings.EqualFold(key, "User-Agent") {
 		e.Config.UserAgent = normalizeUserAgent(val)
 		if e.Config.UserAgent == "" {
 			e.Config.UserAgent = "DirFuzz/2.0"

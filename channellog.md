@@ -1,5 +1,15 @@
 # DirFuzz MCP Monitor Change Log
 
+## v4.0.1 — Reliability & HTTP Fidelity (2026-08-28)
+
+- Reworked `ChangeWordlist` around an explicit submission admission gate, removing the Add-vs-Wait race and the millisecond polling/waiter-goroutine loop.
+- Restart now cancels and drains the previous generation before resetting Bloom-filter, fingerprint, recursion, and telemetry state.
+- Restart result draining begins before cancellation so scanners/workers cannot deadlock on a full results channel during handoff.
+- Wordlist validation now reports every `os.Stat` failure and rejects directories.
+- DirFuzz now owns singleton generated `Host` and `Content-Length` headers; conflicting user/per-job values are ignored instead of producing ambiguous raw requests.
+- Fast-path header templates now sanitize header names and values with the same rules as the normal request-building path.
+- Added v4.0.1 regression coverage; repository CI is enabled separately for tests, vetting, and focused race detection.
+
 This file is the single place for update notes and changelog entries.
 
 ## MCP & Engine Optimization Updates (2026-07-01)

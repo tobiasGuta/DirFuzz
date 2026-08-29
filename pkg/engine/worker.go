@@ -351,7 +351,14 @@ func (e *Engine) worker(id int, ctx context.Context, control *workerControl) {
 				reqHeaders[k] = v
 			}
 			for k, v := range job.ExtraHeaders {
-				reqHeaders[k] = v
+				if isGeneratedRequestHeader(k) {
+					continue
+				}
+				safeK := sanitizeHeaderToken(strings.TrimSpace(k))
+				if safeK == "" {
+					continue
+				}
+				reqHeaders[safeK] = sanitizeHeaderToken(v)
 			}
 			if verbTamper {
 				if overrideHdrs := verbTamperHeaders(job.Method); overrideHdrs != nil {
@@ -1048,9 +1055,18 @@ func (e *Engine) getReplayClient(proxyAddr string) *http.Client {
 
 // Submit adds a payload to the queue if it passes the Bloom filter check.
 func (e *Engine) Submit(job Job) {
-	if job.RunID != atomic.LoadInt64(&e.RunID) {
+	// Register this Submit attempt under the restart admission gate. Once a
+	// restart closes admission, ChangeWordlist can wait for submissionWg and
+	// know that no later activeJobs.Add can race its activeJobs.Wait.
+	e.submissionMu.Lock()
+	if e.restarting || job.RunID != atomic.LoadInt64(&e.RunID) {
+		e.submissionMu.Unlock()
 		return
 	}
+	e.submissionWg.Add(1)
+	e.submissionMu.Unlock()
+	defer e.submissionWg.Done()
+
 	if e.shouldExcludePath(job.Path) {
 		return
 	}
@@ -1065,12 +1081,12 @@ func (e *Engine) Submit(job Job) {
 		return
 	}
 
-	e.activeJobs.Add(1)
 	sc := e.scannerCtx.Load()
-	if sc == nil {
-		e.activeJobs.Done()
+	if sc == nil || sc.ctx.Err() != nil {
 		return
 	}
+
+	e.activeJobs.Add(1)
 	if err := e.jobs.Push(sc.ctx, job); err != nil {
 		e.activeJobs.Done()
 	}

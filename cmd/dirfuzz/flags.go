@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	cliVersion        = "4.0.0"
+	cliVersion        = "4.0.1"
 	defaultMatchCodes = "200,204,301,302,307,308,401,403,405,500"
 	defaultResumeFile = ".dirfuzz-resume.json"
 )
