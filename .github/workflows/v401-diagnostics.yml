@@ -13,21 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - name: Show restart submission boundary
+      - name: Inspect submission accounting
         shell: bash
         run: |
+          echo '===== Submit definitions ====='
+          grep -R -n -B4 -A30 'func (e \*Engine) Submit' pkg/engine || true
+          echo '===== activeJobs Add/Done sites ====='
+          grep -R -n -B5 -A10 'activeJobs\.Add\|activeJobs\.Done\|activeJobs\.Wait' pkg/engine || true
           echo '===== ChangeWordlist ====='
-          line=$(grep -n 'func (e \*Engine) ChangeWordlist' pkg/engine/engine.go | cut -d: -f1)
-          sed -n "${line},$((line+140))p" pkg/engine/engine.go
-          echo '===== Submit locations ====='
-          grep -R -n 'func (e \*Engine) Submit' pkg/engine || true
-          while IFS=: read -r file line rest; do
-            [ -n "$file" ] || continue
-            echo "===== $file:$line ====="
-            sed -n "${line},$((line+80))p" "$file"
-          done < <(grep -R -n 'func (e \*Engine) Submit' pkg/engine || true)
-      - name: Reproduce focused concurrency test
-        run: go test ./pkg/engine -run '^TestChangeWordlistConcurrency$' -count=10 -timeout=90s
+          grep -n -A150 'func (e \*Engine) ChangeWordlist' pkg/engine/engine.go
