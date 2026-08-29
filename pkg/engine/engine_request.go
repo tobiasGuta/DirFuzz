@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -108,11 +109,121 @@ func (e *Engine) Host() string {
 	return e.host
 }
 
+func redirectOrigin(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + ":" + port
+}
+
+func buildRedirectRequest(rawRequest []byte, statusCode int, currentURL string, nextURL *url.URL) ([]byte, error) {
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(rawRequest)))
+	if err != nil {
+		return nil, fmt.Errorf("parse redirect request: %w", err)
+	}
+	defer req.Body.Close()
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read redirect request body: %w", err)
+	}
+
+	method := req.Method
+	dropBody := false
+	switch statusCode {
+	case http.StatusSeeOther:
+		if method != http.MethodHead {
+			method = http.MethodGet
+			dropBody = true
+		}
+	case http.StatusMovedPermanently, http.StatusFound:
+		if method == http.MethodPost {
+			method = http.MethodGet
+			dropBody = true
+		}
+	case http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		// RFC semantics require preserving method and body.
+	}
+	if dropBody {
+		body = nil
+	}
+
+	headers := req.Header.Clone()
+	headers.Del("Host")
+	headers.Del("Content-Length")
+	headers.Del("Transfer-Encoding")
+
+	current, _ := url.Parse(currentURL)
+	if redirectOrigin(current) != redirectOrigin(nextURL) {
+		// Never forward standard credentials to a different origin.
+		headers.Del("Authorization")
+		headers.Del("Cookie")
+		headers.Del("Proxy-Authorization")
+	}
+
+	if len(body) > 0 {
+		headers.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	} else if method == http.MethodPost || method == http.MethodPut || method == http.MethodPatch || method == http.MethodDelete {
+		headers.Set("Content-Length", "0")
+	}
+
+	reqPath := nextURL.EscapedPath()
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	if nextURL.RawQuery != "" {
+		reqPath += "?" + nextURL.RawQuery
+	}
+
+	ua := req.UserAgent()
+	var keys []string
+	for key := range headers {
+		if strings.EqualFold(key, "User-Agent") {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var headerBuilder strings.Builder
+	for _, key := range keys {
+		for _, value := range headers.Values(key) {
+			headerBuilder.WriteString(fmt.Sprintf("%s: %s\r\n", sanitizeHeaderToken(key), sanitizeHeaderToken(value)))
+		}
+	}
+
+	return buildRequest(method, reqPath, nextURL.Host, ua, headerBuilder.String(), string(body)), nil
+}
+
+func automaticRetrySafe(rawRequest []byte) bool {
+	lineEnd := bytes.IndexByte(rawRequest, '\n')
+	if lineEnd == -1 {
+		lineEnd = len(rawRequest)
+	}
+	fields := bytes.Fields(rawRequest[:lineEnd])
+	if len(fields) == 0 {
+		return false
+	}
+	switch strings.ToUpper(string(fields[0])) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
 func (e *Engine) followRedirectChain(
 	ctx context.Context,
 	initialResp *httpclient.RawResponse,
-	targetURL, reqHost, ua string,
-	headers map[string]string,
+	targetURL string,
+	initialRawRequest []byte,
 	maxRedirects int,
 	proxyAddr string,
 	timeout time.Duration,
@@ -120,10 +231,7 @@ func (e *Engine) followRedirectChain(
 	resp := initialResp
 	finalURL := ""
 	currentURL := targetURL
-	ua = normalizeUserAgent(ua)
-	if ua == "" {
-		ua = "DirFuzz/2.0"
-	}
+	currentRawRequest := append([]byte(nil), initialRawRequest...)
 
 	for i := 0; i < maxRedirects; i++ {
 		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
@@ -135,63 +243,35 @@ func (e *Engine) followRedirectChain(
 		}
 
 		baseURL, err := url.Parse(currentURL)
-		if err == nil {
-			if locURL, err := url.Parse(location); err == nil {
-				location = baseURL.ResolveReference(locURL).String()
-			}
-		}
-
-		parsedLoc, err := url.Parse(location)
 		if err != nil {
 			break
 		}
+		locURL, err := url.Parse(location)
+		if err != nil {
+			break
+		}
+		nextURL := baseURL.ResolveReference(locURL)
 
 		// SSRF guard on redirect destinations — allow override via config.
 		e.Config.RLock()
 		allow := e.Config.AllowPrivateTargets
 		e.Config.RUnlock()
-		if err := validateOutboundHostname(parsedLoc.Hostname(), allow); err != nil {
+		if err := validateOutboundHostname(nextURL.Hostname(), allow); err != nil {
 			break
 		}
 
-		reqPath := parsedLoc.Path
-		if parsedLoc.RawQuery != "" {
-			reqPath += "?" + parsedLoc.RawQuery
+		nextRawRequest, err := buildRedirectRequest(currentRawRequest, resp.StatusCode, currentURL, nextURL)
+		if err != nil {
+			break
 		}
-		if reqPath == "" {
-			reqPath = "/"
-		}
-
-		var headersStr strings.Builder
-		for k, v := range headers {
-			if strings.EqualFold(k, "User-Agent") {
-				continue
-			}
-			headersStr.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
-		}
-
-		headersStrVal := headersStr.String()
-		headersLower := strings.ToLower(headersStrVal)
-		var defaultsBuilder strings.Builder
-		if !strings.Contains(headersLower, "\nconnection:") && !strings.HasPrefix(headersLower, "connection:") {
-			defaultsBuilder.WriteString("Connection: keep-alive\r\n")
-		}
-		if !strings.Contains(headersLower, "\naccept:") && !strings.HasPrefix(headersLower, "accept:") {
-			defaultsBuilder.WriteString("Accept: */*\r\n")
-		}
-		
-		rawReq := []byte(fmt.Sprintf(
-			"GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n%s%s\r\n",
-			reqPath, parsedLoc.Host, ua, headersStrVal, defaultsBuilder.String(),
-		))
-
-		nextResp, err := e.executeRequestWithRetry(ctx, location, rawReq, timeout, proxyAddr)
+		nextResp, err := e.executeRequestWithRetry(ctx, nextURL.String(), nextRawRequest, timeout, proxyAddr)
 		if err != nil {
 			break
 		}
 		resp = nextResp
-		finalURL = location
-		currentURL = location
+		finalURL = nextURL.String()
+		currentURL = finalURL
+		currentRawRequest = nextRawRequest
 	}
 
 	return resp, finalURL
@@ -208,6 +288,9 @@ func (e *Engine) executeRequestWithRetry(ctx context.Context, targetURL string, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if !automaticRetrySafe(rawRequest) {
+		retries = 0
+	}
 
 	if h2Mode && e.H2Client != nil {
 		return e.executeH2RequestWithRetry(ctx, targetURL, rawRequest, timeout)
@@ -222,7 +305,7 @@ func (e *Engine) executeRequestWithRetry(ctx context.Context, targetURL string, 
 		resp, err = e.executeRequestOnce(ctx, targetURL, rawRequest, timeout, proxyAddr, insecure, h2Mode, antiBotFallback)
 		if err == nil {
 			e.mergeResponseCookies(targetURL, resp)
-			
+
 			// Inspect response footprint for health/block indicators
 			isBlocked := resp.StatusCode == 429
 			if !isBlocked {
@@ -231,7 +314,7 @@ func (e *Engine) executeRequestWithRetry(ctx context.Context, targetURL string, 
 					isBlocked = true
 				}
 			}
-			
+
 			e.ReportProxyStatus(proxyAddr, isBlocked)
 
 			if retryResp, handled := e.handleAntiBotResponse(ctx, targetURL, rawRequest, timeout, proxyAddr, insecure, h2Mode, antiBotFallback, resp); handled {
@@ -242,7 +325,7 @@ func (e *Engine) executeRequestWithRetry(ctx context.Context, targetURL string, 
 		if isContextDoneError(ctx, err) {
 			return nil, err
 		}
-		
+
 		// If we hit connection error/timeout, report as failure/block candidate
 		e.ReportProxyStatus(proxyAddr, true)
 
@@ -280,6 +363,9 @@ func (e *Engine) executeH2RequestWithRetry(ctx context.Context, targetURL string
 
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if !automaticRetrySafe(rawRequest) {
+		retries = 0
 	}
 
 	backoff := 1 * time.Second

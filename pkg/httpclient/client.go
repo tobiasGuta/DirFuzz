@@ -261,6 +261,7 @@ func SendRawRequestWithContextPolicy(
 ) (*RawResponse, error) {
 	start := time.Now()
 	expectNoBody := requestExpectsNoResponseBody(rawRequest)
+	replaySafe := requestReplaySafe(rawRequest)
 
 	u, err := url.Parse(targetURL)
 	if err != nil {
@@ -325,7 +326,11 @@ func SendRawRequestWithContextPolicy(
 		}
 	}
 
-	// Send the request.
+	// Send the request. Bind socket I/O to context cancellation so a scan
+	// restart/shutdown does not have to wait for the socket deadline.
+	stopContextWatch := stopConnOnContextDone(ctx, conn)
+	defer func() { stopContextWatch() }()
+
 	err = conn.SetDeadline(time.Now().Add(timeout))
 	if err != nil {
 		conn.Close()
@@ -339,13 +344,23 @@ func SendRawRequestWithContextPolicy(
 
 	_, writeErr := conn.Write(rawRequest)
 	if writeErr != nil {
-		// Stale pooled connection — discard and retry with a fresh connection.
+		stopContextWatch()
+		stopContextWatch = func() {}
 		conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// A failed write can still have transmitted a partial request. Only
+		// replay methods whose semantics are safe to repeat automatically.
+		if !replaySafe {
+			return nil, fmt.Errorf("failed to write non-replay-safe request: %w", writeErr)
+		}
 		pooled = false
 		conn, err = dialNew(ctx, u.Scheme, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
 		if err != nil {
 			return nil, err
 		}
+		stopContextWatch = stopConnOnContextDone(ctx, conn)
 		err = conn.SetDeadline(time.Now().Add(timeout))
 		if err != nil {
 			conn.Close()
@@ -353,6 +368,9 @@ func SendRawRequestWithContextPolicy(
 		}
 		if _, err = conn.Write(rawRequest); err != nil {
 			conn.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("failed to write request: %w", err)
 		}
 	}
@@ -360,15 +378,22 @@ func SendRawRequestWithContextPolicy(
 	// Read the response.
 	resp, parseErr := parseRawResponse(conn, expectNoBody)
 	if parseErr != nil {
+		stopContextWatch()
+		stopContextWatch = func() {}
 		conn.Close()
-		// If we used a pooled connection and it failed on read, it might have been stale/half-closed by the server
-		// after the write succeeded but before/during the read. Try once more on a fresh connection.
-		if pooled {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		// A read failure after a successful write is ambiguous: the server may
+		// already have processed the request. Never transparently replay a
+		// non-safe method just because the connection came from the idle pool.
+		if pooled && replaySafe {
 			pooled = false
 			conn, err = dialNew(ctx, u.Scheme, address, host, proxyAddr, proxyIsHTTP, timeout, insecure, allowPrivateTargets)
 			if err != nil {
 				return nil, err
 			}
+			stopContextWatch = stopConnOnContextDone(ctx, conn)
 			err = conn.SetDeadline(time.Now().Add(timeout))
 			if err != nil {
 				conn.Close()
@@ -376,16 +401,28 @@ func SendRawRequestWithContextPolicy(
 			}
 			if _, err = conn.Write(rawRequest); err != nil {
 				conn.Close()
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				return nil, fmt.Errorf("failed to write request: %w", err)
 			}
 			resp, parseErr = parseRawResponse(conn, expectNoBody)
 			if parseErr != nil {
 				conn.Close()
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
 				return nil, parseErr
 			}
 		} else {
 			return nil, parseErr
 		}
+	}
+	stopContextWatch()
+	stopContextWatch = func() {}
+	if ctx.Err() != nil {
+		conn.Close()
+		return nil, ctx.Err()
 	}
 	resp.Duration = time.Since(start)
 
@@ -686,6 +723,8 @@ func dialHTTPProxy(ctx context.Context, proxyAddr, targetAddr string, timeout ti
 	if err != nil {
 		return nil, fmt.Errorf("HTTP proxy dial failed: %w", err)
 	}
+	stopContextWatch := stopConnOnContextDone(ctx, conn)
+	defer stopContextWatch()
 
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", targetAddr, targetAddr)
 	if proxyURL.User != nil {
@@ -968,6 +1007,82 @@ func requestExpectsNoResponseBody(rawRequest []byte) bool {
 	return len(fields) > 0 && bytes.EqualFold(fields[0], []byte(http.MethodHead))
 }
 
+func requestMethod(rawRequest []byte) string {
+	lineEnd := bytes.IndexByte(rawRequest, '\n')
+	if lineEnd == -1 {
+		lineEnd = len(rawRequest)
+	}
+	fields := bytes.Fields(rawRequest[:lineEnd])
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(string(fields[0]))
+}
+
+func requestReplaySafe(rawRequest []byte) bool {
+	switch requestMethod(rawRequest) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+func stopConnOnContextDone(ctx context.Context, conn net.Conn) func() {
+	if ctx == nil || conn == nil || ctx.Done() == nil {
+		return func() {}
+	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	return func() {
+		_ = stop()
+	}
+}
+
+func parseConsistentContentLength(values []string) (int, error) {
+	want := -1
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return -1, fmt.Errorf("empty Content-Length value")
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return -1, fmt.Errorf("invalid Content-Length value %q", value)
+		}
+		if want == -1 {
+			want = n
+			continue
+		}
+		if n != want {
+			return -1, fmt.Errorf("conflicting Content-Length values: %d and %d", want, n)
+		}
+	}
+	return want, nil
+}
+
+func transferEncodingChunkedFinal(value string) (bool, error) {
+	parts := strings.Split(value, ",")
+	if len(parts) == 0 {
+		return false, fmt.Errorf("empty Transfer-Encoding")
+	}
+	seenChunked := false
+	for i, raw := range parts {
+		coding := strings.ToLower(strings.TrimSpace(strings.SplitN(raw, ";", 2)[0]))
+		if coding == "" {
+			return false, fmt.Errorf("invalid empty Transfer-Encoding coding")
+		}
+		if coding == "chunked" {
+			if seenChunked || i != len(parts)-1 {
+				return false, fmt.Errorf("invalid Transfer-Encoding: chunked must appear exactly once and as the final coding")
+			}
+			seenChunked = true
+		}
+	}
+	return seenChunked, nil
+}
+
 func responseHasNoBody(expectNoBody bool, statusCode int) bool {
 	return expectNoBody ||
 		(statusCode >= 100 && statusCode < http.StatusOK) ||
@@ -982,6 +1097,7 @@ func parseRawResponse(conn net.Conn, expectNoBody bool) (*RawResponse, error) {
 	headerEndIdx := -1
 	sepLen := 4
 	contentLength := -1
+	var contentLengthValues []string
 	isChunked := false
 	// protoIsHTTP10 is set when the status line indicates HTTP/1.0. We use
 	// this later to recognise HTTP/1.0 responses that terminate the body by
@@ -1065,6 +1181,9 @@ func parseRawResponse(conn net.Conn, expectNoBody bool) (*RawResponse, error) {
 					}
 					k := strings.ToLower(strings.TrimSpace(parts[0]))
 					v := strings.TrimSpace(parts[1])
+					if k == "content-length" {
+						contentLengthValues = append(contentLengthValues, strings.Split(v, ",")...)
+					}
 					if prev, exists := headerMap[k]; exists {
 						if k == "transfer-encoding" {
 							// Concatenate multiple Transfer-Encoding values.
@@ -1080,12 +1199,21 @@ func parseRawResponse(conn net.Conn, expectNoBody bool) (*RawResponse, error) {
 					}
 					lastKey = k
 				}
-				if te, ok := headerMap["transfer-encoding"]; ok && strings.Contains(strings.ToLower(te), "chunked") {
-					isChunked = true
-				} else if cl, ok := headerMap["content-length"]; ok {
-					if clv, err2 := strconv.Atoi(cl); err2 == nil {
-						contentLength = clv
+				if te, ok := headerMap["transfer-encoding"]; ok {
+					if len(contentLengthValues) > 0 {
+						return nil, fmt.Errorf("ambiguous response framing: Transfer-Encoding and Content-Length are both present")
 					}
+					chunkedFinal, framingErr := transferEncodingChunkedFinal(te)
+					if framingErr != nil {
+						return nil, framingErr
+					}
+					isChunked = chunkedFinal
+				} else if len(contentLengthValues) > 0 {
+					clv, framingErr := parseConsistentContentLength(contentLengthValues)
+					if framingErr != nil {
+						return nil, framingErr
+					}
+					contentLength = clv
 				}
 			}
 		}

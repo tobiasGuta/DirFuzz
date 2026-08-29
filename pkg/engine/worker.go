@@ -526,7 +526,7 @@ func (e *Engine) worker(id int, ctx context.Context, control *workerControl) {
 		// Follow redirects.
 		var finalRedirectURL string
 		if followRedirects && resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			resp, finalRedirectURL = e.followRedirectChain(localCtx, resp, fullURL, reqHost, ua, headers, maxRedirects, proxyAddr, requestTimeout)
+			resp, finalRedirectURL = e.followRedirectChain(localCtx, resp, fullURL, rawRequest, maxRedirects, proxyAddr, requestTimeout)
 		}
 
 		// Update stats counters.
