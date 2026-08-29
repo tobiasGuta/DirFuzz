@@ -1,4 +1,4 @@
-name: v4.0.1 diagnostics
+name: v4.0.1 patch
 
 on:
   push:
@@ -6,19 +6,399 @@ on:
       - fix/v4.0.1-reliability
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inspect:
+  patch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect submission accounting
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Apply reliability fixes
         shell: bash
         run: |
-          echo '===== Submit definitions ====='
-          grep -R -n -B4 -A30 'func (e \*Engine) Submit' pkg/engine || true
-          echo '===== activeJobs Add/Done sites ====='
-          grep -R -n -B5 -A10 'activeJobs\.Add\|activeJobs\.Done\|activeJobs\.Wait' pkg/engine || true
-          echo '===== ChangeWordlist ====='
-          grep -n -A150 'func (e \*Engine) ChangeWordlist' pkg/engine/engine.go
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(src, old, new, label):
+              count = src.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected exactly one match, found {count}')
+              return src.replace(old, new, 1)
+
+          # --- engine.go: restart lifecycle + submission gate state ---
+          path = Path('pkg/engine/engine.go')
+          src = path.read_text()
+          src = replace_once(
+              src,
+              '\tshutdownOnce       sync.Once\n\tchangeWordlistLock sync.Mutex\n',
+              '\tshutdownOnce       sync.Once\n\tchangeWordlistLock sync.Mutex\n\tsubmissionMu       sync.Mutex\n\tsubmissionWg       sync.WaitGroup\n\trestarting         bool\n',
+              'engine submission fields',
+          )
+          start = src.index('func (e *Engine) ChangeWordlist(path string) error {')
+          end = src.index('// drainJobs safely drains all pending jobs from the jobs queue.', start)
+          new_change = r'''func (e *Engine) ChangeWordlist(path string) error {
+	e.changeWordlistLock.Lock()
+	defer e.changeWordlistLock.Unlock()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat wordlist %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("wordlist path is a directory: %s", path)
+	}
+
+	// Restart may be requested while scanners or workers are blocked publishing
+	// old results. Drain only for the duration of the generation handoff so
+	// those goroutines can finish without stealing results from the new run.
+	stopDrain := make(chan struct{})
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			select {
+			case _, ok := <-e.Results:
+				if !ok {
+					return
+				}
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+
+	// Close submission admission before cancelling the old generation. Any
+	// Submit already admitted is tracked by submissionWg; later submissions are
+	// rejected until the new scanner context is installed.
+	e.submissionMu.Lock()
+	e.restarting = true
+	if oldCtx := e.scannerCtx.Load(); oldCtx != nil && oldCtx.cancel != nil {
+		oldCtx.cancel()
+	}
+	sentinelCtx, sentinelCancel := context.WithCancel(context.Background())
+	sentinelCancel()
+	e.scannerCtx.Store(&scannerContext{ctx: sentinelCtx, cancel: sentinelCancel})
+	atomic.AddInt64(&e.RunID, 1) // invalidate children from the previous run
+	e.submissionMu.Unlock()
+
+	// All Submit calls that crossed the admission boundary before restart must
+	// finish before we drain. This removes the Add-vs-Wait race that previously
+	// required polling activeJobs with short-lived waiter goroutines.
+	e.submissionWg.Wait()
+	e.drainJobs()
+
+	// Existing workers and bounded auxiliary tasks may still be finishing old
+	// work, but no new queue submissions can now be admitted.
+	e.activeJobs.Wait()
+	e.scannerWg.Wait()
+
+	close(stopDrain)
+	<-drainDone
+
+	// Drain replay work only after the old generation is fully quiescent.
+	drainLoop:
+	for {
+		select {
+		case <-e.replayCh:
+		default:
+			break drainLoop
+		}
+	}
+
+	// It is now safe to reset generation-scoped mutable state. No old worker is
+	// still reading or writing these structures.
+	e.shardedFilter = newShardedBloomFilter(bloomFilterShards, DefaultBloomFilterSize, DefaultBloomFilterFP)
+
+	atomic.StoreInt64(&e.ProcessedLines, 0)
+	atomic.StoreInt64(&e.TotalLines, 0)
+	atomic.StoreInt64(&e.Count200, 0)
+	atomic.StoreInt64(&e.Count403, 0)
+	atomic.StoreInt64(&e.Count404, 0)
+	atomic.StoreInt64(&e.Count429, 0)
+	atomic.StoreInt64(&e.Count500, 0)
+	atomic.StoreInt64(&e.CountConnErr, 0)
+	atomic.StoreInt64(&e.CurrentRPS, 0)
+	atomic.StoreInt32(&e.alreadyThrottled, 0)
+	atomic.StoreInt64(&e.HarvestedPaths, 0)
+	e.evasionAttempted.Clear()
+	e.recursiveTracker.Clear()
+	e.EvasionScoreboard = NewEvasionScoreboard()
+	e.headRejectedHosts.Range(func(k, _ interface{}) bool {
+		e.headRejectedHosts.Delete(k)
+		return true
+	})
+
+	e.fpMutex.Lock()
+	e.fpCounts = make(map[autoFilterFingerprint]int)
+	e.fpMutex.Unlock()
+	e.simhashTracker.Clear()
+
+	atomic.StoreInt64(&e.AutoFilterSuppressed, 0)
+	atomic.StoreInt64(&e.SimhashSuppressed, 0)
+
+	// Publish the new generation atomically with reopening submission admission.
+	ctx, cancel := context.WithCancel(context.Background())
+	e.submissionMu.Lock()
+	e.scannerCtx.Store(&scannerContext{ctx: ctx, cancel: cancel})
+	e.restarting = false
+	e.submissionMu.Unlock()
+
+	e.KickoffScanner(path, 0)
+	return nil
+}
+
+'''
+          src = src[:start] + new_change + src[end:]
+          path.write_text(src)
+
+          # --- worker.go: make Submit admission atomic across restarts and
+          # sanitize/drop singleton generated headers from per-job overrides. ---
+          path = Path('pkg/engine/worker.go')
+          src = path.read_text()
+          submit_start = src.index('func (e *Engine) Submit(job Job) {')
+          submit_end = src.index('// SubmitHarvestPath adds a harvested path', submit_start)
+          new_submit = r'''func (e *Engine) Submit(job Job) {
+	// Register this Submit attempt under the restart admission gate. Once a
+	// restart closes admission, ChangeWordlist can wait for submissionWg and
+	// know that no later activeJobs.Add can race its activeJobs.Wait.
+	e.submissionMu.Lock()
+	if e.restarting || job.RunID != atomic.LoadInt64(&e.RunID) {
+		e.submissionMu.Unlock()
+		return
+	}
+	e.submissionWg.Add(1)
+	e.submissionMu.Unlock()
+	defer e.submissionWg.Done()
+
+	if e.shouldExcludePath(job.Path) {
+		return
+	}
+
+	filterKey := job.Path
+	if job.Method != "" {
+		filterKey = job.Method + ":" + job.Path
+	}
+
+	if e.shardedFilter.TestAndAddString(filterKey) {
+		atomic.AddInt64(&e.ProcessedLines, 1)
+		return
+	}
+
+	sc := e.scannerCtx.Load()
+	if sc == nil || sc.ctx.Err() != nil {
+		return
+	}
+
+	e.activeJobs.Add(1)
+	if err := e.jobs.Push(sc.ctx, job); err != nil {
+		e.activeJobs.Done()
+	}
+}
+
+'''
+          src = src[:submit_start] + new_submit + src[submit_end:]
+          old_extra = '''\t\t\tfor k, v := range job.ExtraHeaders {\n\t\t\t\treqHeaders[k] = v\n\t\t\t}\n'''
+          new_extra = '''\t\t\tfor k, v := range job.ExtraHeaders {\n\t\t\t\tif isGeneratedRequestHeader(k) {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\tsafeK := sanitizeHeaderToken(strings.TrimSpace(k))\n\t\t\t\tif safeK == "" {\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\t\t\t\treqHeaders[safeK] = sanitizeHeaderToken(v)\n\t\t\t}\n'''
+          src = replace_once(src, old_extra, new_extra, 'worker extra headers')
+          path.write_text(src)
+
+          # --- engine_config.go: generated-header ownership + fast-path sanitation. ---
+          path = Path('pkg/engine/engine_config.go')
+          src = path.read_text()
+          old_snapshot = '''\tfor k, v := range e.Config.Headers {\n\t\tif strings.EqualFold(k, "User-Agent") {\n\t\t\tua = normalizeUserAgent(v)\n\t\t\tcontinue\n\t\t}\n\t\ts.Headers[k] = v\n\t}\n'''
+          new_snapshot = '''\tfor k, v := range e.Config.Headers {\n\t\tif strings.EqualFold(k, "User-Agent") {\n\t\t\tua = sanitizeHeaderToken(normalizeUserAgent(v))\n\t\t\tcontinue\n\t\t}\n\t\tif isGeneratedRequestHeader(k) {\n\t\t\tcontinue\n\t\t}\n\t\tsafeK := sanitizeHeaderToken(strings.TrimSpace(k))\n\t\tif safeK == "" {\n\t\t\tcontinue\n\t\t}\n\t\ts.Headers[safeK] = sanitizeHeaderToken(v)\n\t}\n'''
+          src = replace_once(src, old_snapshot, new_snapshot, 'snapshot headers')
+          add_start = src.index('func (e *Engine) AddHeader(key, val string) {')
+          add_end = src.index('func (e *Engine) RemoveHeader(key string) {', add_start)
+          new_add = r'''func isGeneratedRequestHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "host", "content-length":
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Engine) AddHeader(key, val string) {
+	key = sanitizeHeaderToken(strings.TrimSpace(key))
+	if key == "" || isGeneratedRequestHeader(key) {
+		return
+	}
+	val = sanitizeHeaderToken(val)
+
+	e.Config.Lock()
+	if strings.EqualFold(key, "User-Agent") {
+		e.Config.UserAgent = normalizeUserAgent(val)
+		if e.Config.UserAgent == "" {
+			e.Config.UserAgent = "DirFuzz/2.0"
+		}
+		for hk := range e.Config.Headers {
+			if strings.EqualFold(hk, "User-Agent") {
+				delete(e.Config.Headers, hk)
+			}
+		}
+		e.Config.Unlock()
+		e.scheduleBuildSnapshot()
+		return
+	}
+	e.Config.Headers[key] = val
+	e.Config.Unlock()
+	e.scheduleBuildSnapshot()
+}
+
+'''
+          src = src[:add_start] + new_add + src[add_end:]
+          path.write_text(src)
+
+          # --- version bump ---
+          path = Path('cmd/dirfuzz/flags.go')
+          src = path.read_text()
+          src = replace_once(src, 'cliVersion        = "4.0.0"', 'cliVersion        = "4.0.1"', 'CLI version')
+          path.write_text(src)
+
+          # --- release notes ---
+          path = Path('channellog.md')
+          src = path.read_text()
+          marker = '# DirFuzz MCP Monitor Change Log\n\n'
+          notes = '''## v4.0.1 — Reliability & HTTP Fidelity (2026-08-28)\n\n- Reworked `ChangeWordlist` around an explicit submission admission gate, removing the Add-vs-Wait race and the millisecond polling/waiter-goroutine loop.\n- Restart now cancels and drains the previous generation before resetting Bloom-filter, fingerprint, recursion, and telemetry state.\n- Restart result draining begins before cancellation so scanners/workers cannot deadlock on a full results channel during handoff.\n- Wordlist validation now reports every `os.Stat` failure and rejects directories.\n- DirFuzz now owns singleton generated `Host` and `Content-Length` headers; conflicting user/per-job values are ignored instead of producing ambiguous raw requests.\n- Fast-path header templates now sanitize header names and values with the same rules as the normal request-building path.\n- Added v4.0.1 regression coverage and a repository CI workflow for tests, vetting, and focused race detection.\n\n'''
+          if not src.startswith(marker):
+              raise SystemExit('unexpected changelog header')
+          path.write_text(marker + notes + src[len(marker):])
+
+          # --- regression tests ---
+          Path('pkg/engine/reliability_v401_test.go').write_text(r'''package engine
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestV401GeneratedHeadersAreEngineOwned(t *testing.T) {
+	eng := NewEngine(1, 100, 0.01)
+	eng.AddHeader("Host", "attacker.example")
+	eng.AddHeader("Content-Length", "999")
+	eng.AddHeader("X-Test", "ok")
+
+	snap := eng.configSnap.Load()
+	if snap == nil {
+		t.Fatal("expected config snapshot")
+	}
+	for key := range snap.Headers {
+		if strings.EqualFold(key, "Host") || strings.EqualFold(key, "Content-Length") {
+			t.Fatalf("generated header leaked into snapshot: %q", key)
+		}
+	}
+	if got := snap.Headers["X-Test"]; got != "ok" {
+		t.Fatalf("X-Test = %q, want ok", got)
+	}
+}
+
+func TestV401FastHeaderTemplateSanitizesCRLF(t *testing.T) {
+	eng := NewEngine(1, 100, 0.01)
+	eng.AddHeader("X-Test\r\nInjected", "value\r\nX-Evil: 1")
+
+	snap := eng.configSnap.Load()
+	if snap == nil {
+		t.Fatal("expected config snapshot")
+	}
+	if strings.Count(snap.HeadersTemplate, "\r\n") != 1 {
+		t.Fatalf("expected one sanitized header line, got %q", snap.HeadersTemplate)
+	}
+	if strings.Contains(snap.HeadersTemplate, "\r\nInjected") || strings.Contains(snap.HeadersTemplate, "\r\nX-Evil:") {
+		t.Fatalf("header template contains injected header boundary: %q", snap.HeadersTemplate)
+	}
+}
+
+func TestV401ChangeWordlistConcurrentRestartsComplete(t *testing.T) {
+	tmpDir := t.TempDir()
+	wordlist := filepath.Join(tmpDir, "wordlist.txt")
+	if err := os.WriteFile(wordlist, []byte("test\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile() failed: %v", err)
+	}
+
+	eng := NewEngine(4, 1000, 0.01)
+	if err := eng.SetTarget("http://example.com"); err != nil {
+		t.Fatalf("SetTarget() failed: %v", err)
+	}
+	defer func() {
+		if sc := eng.scannerCtx.Load(); sc != nil && sc.cancel != nil {
+			sc.cancel()
+		}
+		eng.submissionWg.Wait()
+		eng.drainJobs()
+		eng.scannerWg.Wait()
+		eng.Shutdown()
+	}()
+
+	errCh := make(chan error, 64)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 8; j++ {
+					if err := eng.ChangeWordlist(wordlist); err != nil {
+						errCh <- err
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("concurrent ChangeWordlist calls did not complete")
+	}
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("ChangeWordlist() failed: %v", err)
+	}
+}
+
+func TestV401ChangeWordlistRejectsDirectory(t *testing.T) {
+	eng := NewEngine(1, 100, 0.01)
+	if err := eng.ChangeWordlist(t.TempDir()); err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("ChangeWordlist(directory) error = %v, want directory error", err)
+	}
+}
+''')
+
+          # --- permanent CI ---
+          Path('.github/workflows/ci.yml').write_text('''name: ci\n\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n\npermissions:\n  contents: read\n\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n          cache: true\n      - name: Test\n        run: go test ./... -timeout=8m\n      - name: Vet\n        run: go vet ./...\n\n  race:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-go@v5\n        with:\n          go-version-file: go.mod\n          cache: true\n      - name: Focused race tests\n        run: go test -race ./pkg/engine ./pkg/httpclient -timeout=10m\n''')
+          PY
+
+          gofmt -w pkg/engine/engine.go pkg/engine/worker.go pkg/engine/engine_config.go pkg/engine/reliability_v401_test.go cmd/dirfuzz/flags.go
+          rm .github/workflows/v401-diagnostics.yml
+
+      - name: Focused v4.0.1 tests
+        run: go test ./pkg/engine -run 'V401|ChangeWordlistConcurrency' -count=10 -timeout=2m
+      - name: Full test suite
+        run: go test ./... -timeout=8m
+      - name: Vet
+        run: go vet ./...
+      - name: Focused race tests
+        run: go test -race ./pkg/engine ./pkg/httpclient -timeout=10m
+      - name: Commit verified patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git diff --cached --stat
+          git commit -m 'fix: harden v4.0.1 reliability boundaries'
+          git push origin HEAD:fix/v4.0.1-reliability
