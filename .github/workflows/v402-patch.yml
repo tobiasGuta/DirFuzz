@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   patch:
-    if: github.event.head_commit.message == 'chore: run v4.0.2 patch'
+    if: ${{ github.event.head_commit.message == 'chore: run v4.0.2 patch' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -25,7 +25,7 @@ jobs:
       - name: Recover and apply staged patch
         shell: bash
         run: |
-          git show HEAD^:.github/workflows/v402-patch.yml > /tmp/v402-old.yml
+          git show HEAD^^:.github/workflows/v402-patch.yml > /tmp/v402-old.yml
           python <<'PY'
           from pathlib import Path
           text = Path('/tmp/v402-old.yml').read_text()
